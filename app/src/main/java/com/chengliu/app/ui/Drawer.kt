@@ -34,6 +34,7 @@ fun AppDrawerContent(
     current: String,
     onNavigate: (String) -> Unit,
     onThemeClick: () -> Unit,
+    onCheckUpdate: () -> Unit,
 ) {
     val ui = LocalUi.current
     Column(
@@ -78,6 +79,8 @@ fun AppDrawerContent(
             DrawerDivider()
             val about = navItem("about")
             DrawerRow(about, current == about.key) { onNavigate(about.key) }
+            DrawerDivider()
+            DrawerRow(NavItem("update", "检查更新", Glyph.UPDATE, ui.sub), false) { onCheckUpdate() }
             DrawerRow(navItem("theme"), false) { onThemeClick() }
 
             Spacer(Modifier.height(20.dp))

@@ -18,7 +18,7 @@ import kotlin.math.sin
 
 /** 全部图标为本项目自绘的 24×24 线性图形，不引入任何图标库或第三方素材。 */
 enum class Glyph {
-    MENU, BACK, HOME, RULES, UPSTREAM, BLOCKED, ALLOWED, SUBSCRIBE, PRIVACY, ABOUT, THEME, PLAY, STOP, SHIELD, LOOK, SKIP,
+    MENU, BACK, HOME, RULES, UPSTREAM, BLOCKED, ALLOWED, SUBSCRIBE, PRIVACY, ABOUT, THEME, PLAY, STOP, SHIELD, LOOK, SKIP, UPDATE,
 }
 
 @Composable
@@ -182,6 +182,14 @@ private fun DrawScope.drawGlyph(g: Glyph, c: Color) {
             drawLine(c, Offset(7f, 19f), Offset(13f, 12f), 1.8f, StrokeCap.Round)
             drawLine(c, Offset(14.5f, 5f), Offset(14.5f, 19f), 1.8f, StrokeCap.Round)
             drawLine(c, Offset(17f, 5f), Offset(17f, 19f), 1.8f, StrokeCap.Round)
+        }
+
+        Glyph.UPDATE -> {
+            // 下载箭头：竖线 + 箭头 + 托盘，表示「获取更新」
+            drawLine(c, Offset(12f, 4f), Offset(12f, 16f), 1.8f, StrokeCap.Round)
+            drawLine(c, Offset(7.5f, 11.5f), Offset(12f, 16f), 1.8f, StrokeCap.Round)
+            drawLine(c, Offset(16.5f, 11.5f), Offset(12f, 16f), 1.8f, StrokeCap.Round)
+            drawLine(c, Offset(6f, 20f), Offset(18f, 20f), 1.8f, StrokeCap.Round)
         }
     }
 }

@@ -61,6 +61,17 @@ Two steps after install, or features won't work:
 | **Self-built DoH socket** | DoH uses a hand-built socket for SNI + cert validation, bypassing system resolution to avoid local DNS leaks |
 | **Private DNS avoidance** | Reads the system "Private DNS" state and avoids conflicting with it |
 
+### 🔄 In-app updates
+
+| Feature | Description |
+|---|---|
+| **Manual check** | Triggered from "Check for updates" in the side drawer or the button at the bottom of the "Privacy & About" page; only connects when you tap, never in the background |
+| **Multi-source fallback** | Version info is fetched concurrently from `update.json` in the repo (raw / jsDelivr) and the GitHub Releases API, then the highest version wins; downloads retry across mirrors |
+| **Signature check** | The downloaded APK's signature is compared with the installed one before installing; a mismatch blocks it, keeping out repackaged unofficial builds |
+| **You decide** | Once downloaded, the system installer takes over — you confirm the install |
+
+> Maintainers releasing a new version should sync three places: ① `versionCode` / `versionName` in `app/build.gradle.kts`, ② `version` / `notes` in the repo-root `update.json`, ③ replace `app-release.apk` and update the Release. If they disagree, the app picks the highest version so an update is never missed.
+
 ---
 
 ## 🖼 Screenshots

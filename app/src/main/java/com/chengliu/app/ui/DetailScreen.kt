@@ -80,7 +80,7 @@ import java.net.URL
  * 不建数据库、不落任何查询记录。
  */
 @Composable
-fun DetailScreen(section: String, onBack: () -> Unit) {
+fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit) {
     val ui = LocalUi.current
     val ctx = LocalContext.current
     val prefs = remember { AppPrefs(ctx) }
@@ -503,7 +503,7 @@ fun DetailScreen(section: String, onBack: () -> Unit) {
             "about" -> AboutPage(onClear = {
                 Counters.clear()
                 message = "今日计数已清空"
-            })
+            }, onCheckUpdate = onCheckUpdate)
 
             "skipad" -> SkipAdPage(ctx = ctx, prefs = prefs, scope = scope)
         }
@@ -1264,7 +1264,7 @@ private fun SubsPage(
 }
 
 @Composable
-private fun AboutPage(onClear: () -> Unit) {
+private fun AboutPage(onClear: () -> Unit, onCheckUpdate: () -> Unit) {
     Card {
         SectionLabel("隐私")
         Note("查询过的域名不写入磁盘、不上传、不进系统日志。")
@@ -1294,6 +1294,13 @@ private fun AboutPage(onClear: () -> Unit) {
         Note("Time Leak ${BuildConfig.VERSION_NAME} · 完全原创实现")
         Spacer(Modifier.height(8.dp))
         Note("未使用任何第三方项目的代码、名称、图标或服务端；界面与交互为独立设计。")
+    }
+    Spacer(Modifier.height(12.dp))
+    Card {
+        SectionLabel("更新")
+        Note("当前版本 Time Leak ${BuildConfig.VERSION_NAME}")
+        Spacer(Modifier.height(10.dp))
+        ActionButton("检查更新", onCheckUpdate, onCard = true)
     }
 }
 

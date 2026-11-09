@@ -51,6 +51,16 @@ import com.chengliu.app.ui.HomeScreen
 import com.chengliu.app.ui.LocalUi
 import kotlinx.coroutines.launch
 
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.core.content.FileProvider
+import com.chengliu.app.BuildConfig
+import com.chengliu.app.core.UpdateChecker
+import kotlinx.coroutines.Job
+import java.io.File
+
 class MainActivity : ComponentActivity() {
 
     private lateinit var vpnLauncher: ActivityResultLauncher<Intent>
@@ -113,10 +123,20 @@ private fun AppRoot(
     onThemeChange: (String) -> Unit,
 ) {
     val ui = LocalUi.current
+    val context = LocalContext.current
     var page by remember { mutableStateOf("home") }
     var showTheme by remember { mutableStateOf(false) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    var updateUi by remember { mutableStateOf<UpdateUi>(UpdateUi.Hidden) }
+    var updateJob by remember { mutableStateOf<Job?>(null) }
+
+    // 关闭弹窗时若还有任务在跑，必须先取消，否则下一次进度回调会把弹窗又弹回来
+    fun dismissUpdate() {
+        updateJob?.cancel()
+        updateJob = null
+        updateUi = UpdateUi.Hidden
+    }
 
     val running by VpnState.running.collectAsState()
     val error by VpnState.error.collectAsState()
@@ -132,6 +152,56 @@ private fun AppRoot(
     fun navigate(key: String) {
         page = key
         closeDrawer()
+    }
+
+    fun checkUpdate() {
+        updateJob?.cancel()
+        updateJob = scope.launch {
+            updateUi = UpdateUi.Checking
+            val r = UpdateChecker.check()
+            // 用户可能在检查期间关掉了弹窗：别把结果再写回去
+            if (updateUi !is UpdateUi.Checking) return@launch
+            updateUi = when (r) {
+                is UpdateChecker.Result.Latest -> UpdateUi.Latest
+                is UpdateChecker.Result.Available -> UpdateUi.Available(r.info)
+                is UpdateChecker.Result.Error -> UpdateUi.Error(r.message)
+            }
+        }
+    }
+
+    fun downloadAndInstall(info: UpdateChecker.UpdateInfo) {
+        val dest = File(context.cacheDir, "updates/update.apk")
+        dest.parentFile?.mkdirs()
+        updateJob?.cancel()
+        updateJob = scope.launch {
+            updateUi = UpdateUi.Downloading(0, 0)
+            val ok = UpdateChecker.download(info.downloadUrls, dest) { done, total ->
+                if (updateUi is UpdateUi.Downloading) updateUi = UpdateUi.Downloading(done, total)
+            }
+            if (updateUi !is UpdateUi.Downloading) return@launch
+            if (!ok) {
+                updateUi = UpdateUi.Error("下载失败，请检查网络后重试")
+                return@launch
+            }
+            runCatching { dest.setReadable(true, false) }
+            if (!UpdateChecker.signaturesMatch(context, dest.absolutePath)) {
+                updateUi = UpdateUi.SignatureMismatch
+                return@launch
+            }
+            // 多源兜底可能拿回旧包（例如 Release 附件还没更新），装上去只会失败，先明确告知
+            val downloadedCode = UpdateChecker.archiveVersionCode(context, dest.absolutePath)
+            if (downloadedCode >= 0 && downloadedCode <= BuildConfig.VERSION_CODE) {
+                updateUi = UpdateUi.Error("下载到的仍是旧版本安装包，请稍后再试或到 GitHub 手动下载")
+                return@launch
+            }
+            val uri = FileProvider.getUriForFile(context, context.packageName + ".fileprovider", dest)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            runCatching { context.startActivity(intent) }
+            updateUi = UpdateUi.Hidden
+        }
     }
 
     BackHandler(enabled = drawerState.isOpen || page != "home") {
@@ -194,6 +264,7 @@ private fun AppRoot(
                         showTheme = true
                         closeDrawer()
                     },
+                    onCheckUpdate = { checkUpdate() },
                 )
             }
         },
@@ -211,7 +282,96 @@ private fun AppRoot(
                 onOpenMenu = { scope.launch { drawerState.open() } },
                 onOpen = { page = it },
             )
-            else -> DetailScreen(section = page, onBack = { page = "home" })
+            else -> DetailScreen(section = page, onBack = { page = "home" }, onCheckUpdate = { checkUpdate() })
         }
     }
+
+    if (updateUi !is UpdateUi.Hidden) {
+        val s = updateUi
+        AlertDialog(
+            onDismissRequest = { dismissUpdate() },
+            containerColor = ui.card,
+            titleContentColor = ui.text,
+            textContentColor = ui.text,
+            title = {
+                Text(
+                    when (s) {
+                        is UpdateUi.Checking -> "检查更新"
+                        is UpdateUi.Latest -> "已是最新"
+                        is UpdateUi.Available -> "发现新版本 v${s.info.latestVersion}"
+                        is UpdateUi.Downloading -> "下载中"
+                        is UpdateUi.Error -> "更新失败"
+                        is UpdateUi.SignatureMismatch -> "无法安装"
+                        else -> ""
+                    },
+                    fontSize = 16.sp, fontWeight = FontWeight.Medium,
+                )
+            },
+            text = {
+                when (s) {
+                    is UpdateUi.Checking -> Text("正在连接更新服务器…", fontSize = 13.sp, color = ui.sub)
+                    is UpdateUi.Latest -> Text("当前已是最新版本 Time Leak ${BuildConfig.VERSION_NAME}", fontSize = 13.sp, color = ui.sub)
+                    is UpdateUi.Available -> Column {
+                        if (s.info.notes.isNotBlank()) {
+                            Text(s.info.notes, fontSize = 12.sp, color = ui.sub, lineHeight = 19.sp)
+                            Spacer(Modifier.height(10.dp))
+                        }
+                        Text("当前 ${BuildConfig.VERSION_NAME} → 最新 ${s.info.latestVersion}", fontSize = 12.sp, color = ui.accent)
+                    }
+                    is UpdateUi.Downloading -> Column {
+                        val pct = if (s.total > 0) (s.done * 100 / s.total).toInt() else 0
+                        LinearProgressIndicator(
+                            { if (s.total > 0) (s.done.toFloat() / s.total).coerceIn(0f, 1f) else 0f },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        Text("${formatMB(s.done)} / ${formatMB(s.total)}  ($pct%)", fontSize = 12.sp, color = ui.sub)
+                    }
+                    is UpdateUi.Error -> Text(s.message, fontSize = 13.sp, color = ui.sub)
+                    is UpdateUi.SignatureMismatch -> Text(
+                        "下载的安装包与已安装版本签名不一致，可能来自非官方渠道，已停止安装。请从 GitHub 仓库 xyzOvO/TimeLeak 获取官方包。",
+                        fontSize = 13.sp, color = ui.sub,
+                    )
+                    else -> {}
+                }
+            },
+            confirmButton = {
+                when (s) {
+                    is UpdateUi.Available -> TextButton(onClick = { downloadAndInstall(s.info) }) {
+                        Text("下载并安装", color = ui.accent)
+                    }
+                    is UpdateUi.Error -> TextButton(onClick = { checkUpdate() }) {
+                        Text("重试", color = ui.accent)
+                    }
+                    is UpdateUi.Checking, is UpdateUi.Downloading ->
+                        TextButton(onClick = { dismissUpdate() }) {
+                            Text("取消", color = ui.sub)
+                        }
+                    else -> TextButton(onClick = { dismissUpdate() }) {
+                        Text("关闭", color = ui.accent)
+                    }
+                }
+            },
+            dismissButton = if (s is UpdateUi.Available) {
+                { TextButton(onClick = { dismissUpdate() }) { Text("稍后", color = ui.sub) } }
+            } else null,
+        )
+    }
+}
+
+/** 应用内「检测更新」的弹窗状态机。 */
+private sealed interface UpdateUi {
+    object Hidden : UpdateUi
+    object Checking : UpdateUi
+    object Latest : UpdateUi
+    data class Available(val info: UpdateChecker.UpdateInfo) : UpdateUi
+    data class Downloading(val done: Long, val total: Long) : UpdateUi
+    data class Error(val message: String) : UpdateUi
+    object SignatureMismatch : UpdateUi
+}
+
+private fun formatMB(bytes: Long): String {
+    if (bytes <= 0) return "0.0 MB"
+    val mb = bytes / (1024.0 * 1024.0)
+    return if (mb < 1) "${bytes / 1024} KB" else String.format("%.1f MB", mb)
 }
