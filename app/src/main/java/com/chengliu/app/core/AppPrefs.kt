@@ -2,6 +2,7 @@ package com.chengliu.app.core
 
 import android.content.Context
 import android.content.SharedPreferences
+import org.json.JSONObject
 
 /** 全部配置集中在一个 SharedPreferences 文件里，不建数据库、不落查询日志。 */
 class AppPrefs(ctx: Context) {
@@ -33,6 +34,27 @@ class AppPrefs(ctx: Context) {
     var subscriptionCache: String
         get() = sp.getString(KEY_SUB_CACHE, "") ?: ""
         set(v) = sp.edit().putString(KEY_SUB_CACHE, v).apply()
+
+    /**
+     * 每个订阅地址对应的正文。按来源分别保存，移除某个订阅时只丢那一条，
+     * 不会把其余订阅已下载的规则一起冲掉（之前只存了合并后的文本，移除即失效）。
+     */
+    var subscriptionCacheMap: Map<String, String>
+        get() {
+            val raw = sp.getString(KEY_SUB_MAP, "") ?: ""
+            if (raw.isEmpty()) return emptyMap()
+            return runCatching {
+                val o = JSONObject(raw)
+                val m = LinkedHashMap<String, String>()
+                o.keys().forEach { m[it] = o.getString(it) }
+                m
+            }.getOrDefault(emptyMap())
+        }
+        set(v) {
+            val o = JSONObject()
+            v.forEach { (k, value) -> o.put(k, value) }
+            sp.edit().putString(KEY_SUB_MAP, o.toString()).apply()
+        }
 
     /** system = 系统探测；ip = 用户指定 IP；doh = 加密上游 */
     var upstreamMode: String
@@ -113,6 +135,24 @@ class AppPrefs(ctx: Context) {
     var skipSubCache: String
         get() = sp.getString("skip_sub_cache", "") ?: ""
         set(v) = sp.edit().putString("skip_sub_cache", v).apply()
+
+    /** 每个 GKD 订阅地址对应的 JSON5 正文，按来源分别保存，移除单条时只丢那条。 */
+    var skipSubCacheMap: Map<String, String>
+        get() {
+            val raw = sp.getString("skip_sub_map", "") ?: ""
+            if (raw.isEmpty()) return emptyMap()
+            return runCatching {
+                val o = JSONObject(raw)
+                val m = LinkedHashMap<String, String>()
+                o.keys().forEach { m[it] = o.getString(it) }
+                m
+            }.getOrDefault(emptyMap())
+        }
+        set(v) {
+            val o = JSONObject()
+            v.forEach { (k, value) -> o.put(k, value) }
+            sp.edit().putString("skip_sub_map", o.toString()).apply()
+        }
 
     /** 上次成功拉取订阅的时间戳，0 表示从未拉过。 */
     var skipSubAt: Long
@@ -200,6 +240,7 @@ class AppPrefs(ctx: Context) {
         private const val KEY_ALLOWED = "allowed"
         private const val KEY_SUBS = "subs"
         private const val KEY_SUB_CACHE = "sub_cache"
+        private const val KEY_SUB_MAP = "sub_map"
         private const val KEY_SKIP_SUBS = "skip_subs"
         private const val KEY_SKIP_SUB_AT = "skip_sub_at"
         private const val KEY_SKIP_AUTO = "skip_auto_update"

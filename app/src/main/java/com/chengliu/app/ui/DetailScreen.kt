@@ -139,9 +139,11 @@ fun DetailScreen(section: String, onBack: () -> Unit) {
         }
         refreshing = true
         scope.launch {
-            val result = withContext(Dispatchers.IO) {
-                val parts = mutableListOf<String>()
-                var ok = 0
+            // 从已有的按源缓存出发：本次刷新成功的覆盖旧值，失败的（断网 / 源挂了）
+            // 仍保留上次的规则，避免一次网络抖动把其它订阅一起冲掉。
+            val map = prefs.subscriptionCacheMap.toMutableMap()
+            var ok = 0
+            withContext(Dispatchers.IO) {
                 for (u in subs) {
                     var conn: HttpURLConnection? = null
                     try {
@@ -154,7 +156,7 @@ fun DetailScreen(section: String, onBack: () -> Unit) {
                         if (code in 200..299) {
                             val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
                             if (body.isNotBlank()) {
-                                parts.add(body)
+                                map[u] = body
                                 ok++
                             }
                         }
@@ -163,14 +165,24 @@ fun DetailScreen(section: String, onBack: () -> Unit) {
                         conn?.disconnect()
                     }
                 }
-                parts.joinToString("\n") to ok
             }
-            val (merged, ok) = result
+            prefs.subscriptionCacheMap = map
+            val merged = map.values.joinToString("\n")
             prefs.subscriptionCache = merged
             subCount = RuleParser.parse(merged).size
             message = "更新完成：$ok/${subs.size} 个来源，共 $subCount 条规则"
             notifyService()
             refreshing = false
+        }
+    }
+
+    // 老版本只存了合并后的文本。进入订阅页时发现「有缓存却没按源记录」就补刷一次，
+    // 这样「移除单条」才能正确只丢那一条，而不是把所有规则一起清掉。
+    LaunchedEffect(section) {
+        if (section == "subs" && subs.isNotEmpty() &&
+            prefs.subscriptionCacheMap.isEmpty() && prefs.subscriptionCache.isNotBlank()
+        ) {
+            refresh()
         }
     }
 
@@ -477,6 +489,14 @@ fun DetailScreen(section: String, onBack: () -> Unit) {
                 onRemove = { u ->
                     subs = subs - u
                     prefs.subscriptions = subs.toSet()
+                    // 只丢这一条源的缓存，其余订阅的规则照常生效
+                    val map = prefs.subscriptionCacheMap.toMutableMap()
+                    map.remove(u)
+                    prefs.subscriptionCacheMap = map
+                    val merged = map.values.joinToString("\n")
+                    prefs.subscriptionCache = merged
+                    subCount = RuleParser.parse(merged).size
+                    notifyService()
                 },
             )
 
@@ -833,18 +853,34 @@ private fun UpstreamPage(
             "ip" to "指定上游 IP",
             "doh" to "加密 DoH",
         )
+        // 防泄露模式下上游被强制为 DoH，下面三个选项此时无效：
+        // 既不让点（避免「选了却没生效」的错觉），也把 DoH 标成选中状态，和真实行为对齐。
+        val locked = leakGuard
         options.forEach { (key, label) ->
+            val on = if (locked) key == "doh" else mode == key
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(44.dp)
-                    .clickable { onModeChange(key) },
+                    .clickable(enabled = !locked) { onModeChange(key) },
             ) {
-                RadioButton(selected = mode == key, onClick = { onModeChange(key) })
+                RadioButton(
+                    selected = on,
+                    enabled = !locked,
+                    onClick = { if (!locked) onModeChange(key) },
+                )
                 Spacer(Modifier.width(4.dp))
-                Text(label, fontSize = 14.sp, color = ui.text)
+                Text(
+                    label,
+                    fontSize = 14.sp,
+                    color = if (locked && key != "doh") ui.sub else ui.text,
+                )
             }
+        }
+        if (locked) {
+            Spacer(Modifier.height(8.dp))
+            Note("防泄露已开启，上游锁定为加密 DoH；在「防泄露」页关闭该模式后才能改这里。", ui.warn)
         }
     }
     Spacer(Modifier.height(12.dp))
@@ -1393,7 +1429,8 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
         }
         refreshing = true
         scope.launch {
-            val parts = mutableListOf<String>()
+            // 按来源分别存：移除某条订阅时只丢那条，其余规则照常生效
+            val bodies = prefs.skipSubCacheMap.toMutableMap()
             var ok = 0
             // 网络必须在 IO 线程：之前直接跑在主线程会抛 NetworkOnMainThreadException
             withContext(Dispatchers.IO) {
@@ -1410,7 +1447,7 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                         if (code in 200..299) {
                             val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
                             if (body.isNotBlank()) {
-                                parts.add(body)
+                                bodies[u] = body
                                 ok++
                             }
                             android.util.Log.i("SkipAd", "订阅 $u -> HTTP $code, ${body.length} 字符")
@@ -1423,11 +1460,12 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                 }
             }
             refreshing = false
-            if (parts.isEmpty()) {
+            if (bodies.isEmpty()) {
                 if (!auto) message = "更新失败：连不上订阅源，换个网络再试"
                 return@launch
             }
-            val merged = parts.joinToString("\n")
+            prefs.skipSubCacheMap = bodies
+            val merged = bodies.values.joinToString("\n")
             prefs.skipSubCache = merged
             prefs.skipSubAt = System.currentTimeMillis()
             updatedLabel = subTimeLabel(prefs.skipSubAt)
@@ -1669,7 +1707,22 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
             Note("当前没有订阅源，仅靠内置规则工作。")
         } else {
             subs.forEach { u ->
-                RuleRow(u) { subs = (subs - u).also { prefs.skipSubs = it.toSet() } }
+                RuleRow(u) {
+                    subs = (subs - u).also { prefs.skipSubs = it.toSet() }
+                    // 只丢这一条订阅的缓存，其余规则照常生效
+                    val map = prefs.skipSubCacheMap.toMutableMap()
+                    map.remove(u)
+                    prefs.skipSubCacheMap = map
+                    val merged = map.values.joinToString("\n")
+                    prefs.skipSubCache = merged
+                    scope.launch {
+                        withContext(Dispatchers.Default) {
+                            SkipEngine.ensureLoaded(merged, prefs.customRules)
+                        }
+                        subCount = SkipEngine.groupCount()
+                    }
+                    message = "已移除该订阅源，其余规则仍在"
+                }
             }
         }
         Spacer(Modifier.height(6.dp))
