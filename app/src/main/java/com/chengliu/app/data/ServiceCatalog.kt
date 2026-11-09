@@ -6,6 +6,10 @@ enum class ServiceKind(val label: String) {
     TRACK("统计追踪"),
     ATTRIB("安装归因"),
     TELEMETRY("设备上报"),
+    PCDN("带宽共享"),
+    NONAD("争议拦截"),
+    CDN("公共 CDN"),
+    FAMILY("厂商域名族"),
     OTHER("未收录"),
 }
 
@@ -14,6 +18,8 @@ enum class ServiceKind(val label: String) {
  *
  * what / why 都刻意写成一句人话：用户看到的应该是「它做什么」，
  * 而不是「域名为 doubleclick.net」这种只有工程师看得懂的东西。
+ * evidence 不能为空：卡片会把它显示成「资料依据」，没有依据的条目
+ * 应当交给 ServiceExplainer 的推断层，而不是混进这张归属表里。
  */
 data class ServiceInfo(
     val key: String,
@@ -23,6 +29,8 @@ data class ServiceInfo(
     val what: String,
     val why: String,
     val suffixes: List<String>,
+    /** 这条归属说明的公开依据；空表示「按形态推断，无归属资料」。 */
+    val evidence: String = "",
 )
 
 /**
@@ -42,7 +50,10 @@ object ServiceCatalog {
         what: String,
         why: String,
         vararg suffixes: String,
-    ) = ServiceInfo(key, name, owner, kind, what, why, suffixes.toList())
+    ) = ServiceInfo(
+        key, name, owner, kind, what, why, suffixes.toList(),
+        "厂商公开产品说明 / 隐私政策；按域名用途人工归类（未逐条附链接）",
+    )
 
     val ALL: List<ServiceInfo> = listOf(
         // ── 广告投放 ──────────────────────────────────────────────
@@ -477,15 +488,25 @@ object ServiceCatalog {
         ),
     )
 
-    private val index: Map<String, ServiceInfo> = buildMap {
+    private val manualIndex: Map<String, ServiceInfo> = buildMap {
         for (s in ALL) for (suffix in s.suffixes) put(suffix.lowercase(), s)
     }
 
-    /** 从最具体的子域往上找，最长后缀优先。 */
+    /**
+     * 两张表合成一张索引再按「最长后缀」逐级查：生成表里更精确的子域
+     * （例如 -ad.a.yximgs.com 是广告）必须能盖过手工表里较宽的父域，
+     * 否则「整体手工表优先」会把广告子域说成内容 CDN。
+     * 同一个后缀冲突时，人工核实过的手工表覆盖生成表。
+     */
+    private val mergedIndex: Map<String, ServiceInfo> = buildMap {
+        for (s in GeneratedCatalog.ALL) for (x in s.suffixes) put(x.lowercase(), s)
+        manualIndex.forEach { (k, v) -> put(k, v) }
+    }
+
     fun lookup(domain: String): ServiceInfo? {
         var cursor = domain.trim().trimEnd('.').lowercase()
         while (cursor.isNotEmpty()) {
-            index[cursor]?.let { return it }
+            mergedIndex[cursor]?.let { return it }
             val dot = cursor.indexOf('.')
             if (dot < 0) return null
             cursor = cursor.substring(dot + 1)
@@ -493,5 +514,15 @@ object ServiceCatalog {
         return null
     }
 
-    fun size(): Int = index.size
+    /** 手工表登记的后缀数，用于界面上的说明表统计。 */
+    fun size(): Int = manualIndex.size
+    fun generatedSize(): Int = GeneratedCatalog.size()
+    fun ruleSource(): String = GeneratedCatalog.RULE_SOURCE
+
+    /** 说明表对应哪一版规则，显示成 anti-AD 的日期戳，便于核对有没有漏同步。 */
+    fun ruleSourceLabel(): String {
+        val s = GeneratedCatalog.RULE_SOURCE
+        return if (s.length >= 8) "${s.substring(0, 4)}-${s.substring(4, 6)}-${s.substring(6, 8)}"
+        else "当前规则"
+    }
 }

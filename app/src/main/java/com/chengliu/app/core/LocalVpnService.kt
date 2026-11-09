@@ -101,6 +101,9 @@ class LocalVpnService : VpnService() {
     /** 上一次生效的接管集合签名；私人 DNS 地址变化时用来判断是否真的需要重建隧道 */
     private var lastCaptureKey = ""
 
+    /** 区分「用户主动关」与「服务被系统弄死」，后者才允许有限恢复。 */
+    private var userStopped = false
+
     /** 监听底层网络变化（含系统私人 DNS 校验完成），以便运行中动态避让 */
     private var linkCallback: ConnectivityManager.NetworkCallback? = null
 
@@ -111,6 +114,8 @@ class LocalVpnService : VpnService() {
         super.onCreate()
         prefs = AppPrefs(this)
         Counters.init(this)
+        // 开机恢复时服务可能比界面先起来，这里也初始化一次（幂等）。
+        RunStats.init(this)
         createChannel()
         reloadRules()
         registerLinkCallback()
@@ -118,14 +123,20 @@ class LocalVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_START -> startTunnel()
+            ACTION_START -> {
+                userStopped = false
+                startTunnel()
+            }
             ACTION_STOP -> {
+                // 用户主动关闭：onDestroy 里绝不能触发自动恢复。
+                userStopped = true
                 stopTunnel()
                 stopSelf()
             }
             ACTION_RELOAD -> reloadRules()
             ACTION_RESTART -> {
                 // 路由集合变了只能重建隧道；不 stopSelf，避免前台服务被系统回收
+                userStopped = false
                 stopTunnel()
                 startTunnel()
             }
@@ -134,6 +145,8 @@ class LocalVpnService : VpnService() {
     }
 
     override fun onRevoke() {
+        // 用户在系统里撤销 VPN 授权属于主动操作，不自动拉起，也不弹授权框。
+        userStopped = true
         stopTunnel()
         stopSelf()
         super.onRevoke()
@@ -142,6 +155,11 @@ class LocalVpnService : VpnService() {
     override fun onDestroy() {
         unregisterLinkCallback()
         stopTunnel()
+        // 服务异常退出（省电策略 / 系统回收）时的有限恢复。
+        // 只有用户打开了「开机 / 异常自动恢复」才会尝试，且要过恢复预算。
+        if (!userStopped && AppPrefs(this).bootRestore) {
+            ServiceRecovery.tryRestartVpn(this, "服务异常退出")
+        }
         super.onDestroy()
     }
 
@@ -282,7 +300,11 @@ class LocalVpnService : VpnService() {
         val bootstrap = q != null && isBootstrap(q.name)
         val local = if (q != null && !bootstrap) handler.intercept(q, raw) else null
         if (local != null) return local
-        if (q != null && !bootstrap) watch(q.name)
+        if (q != null && !bootstrap) {
+            // 命中放行名单的域名单独记一个去重集合，供「被放行的域名数量」展示。
+            if (engine.isAllowed(q.name)) RunStats.onAllowed(q.name)
+            watch(q.name)
+        }
 
         // 转发前剥掉 ECS：上游不必知道你在哪个区县
         val forward = if (prefs.stripEcs) DnsWire.stripEcs(raw, raw.size) ?: raw else raw
@@ -384,6 +406,8 @@ class LocalVpnService : VpnService() {
             val allow = BuiltinRules.ALLOWED + RuleStore.allowedOf(tier.key) +
                 prefs.customAllowed + sub.allowed
             engine.replace(builtin, custom, sub.blocked, allow)
+            // 每次重载都重读规则文件头与订阅列表，让拦截记录里的「来自」跟着同步
+            SourceInfo.refresh(this, prefs)
             BlockLog.enabled = prefs.blockLog
             if (!prefs.blockLog) BlockLog.clear()
             handler = BlocklistDnsHandler(engine, ::onBlocked)
@@ -413,8 +437,14 @@ class LocalVpnService : VpnService() {
         apply()
         RuleStore.load(this, tier.key) {
             mainHandler.post {
+                val n = RuleStore.blockedOf(tier.key).size
+                // assets 里三档规则都远多于手工核心名单；条数掉到这个量级
+                // 就说明文件缺失或读坏了，必须把错误显示出来，而不是静默兜底。
+                prefs.ruleLoadError = if (n <= BuiltinRules.DOMAINS.size) {
+                    "规则文件缺失或解析失败，当前只加载了内置核心名单（$n 条）"
+                } else ""
                 if (RuleTier.of(prefs.ruleTier) == tier && prefs.builtinEnabled == builtinOn) {
-                    Log.i(TAG, "内置规则加载完成：${tier.label} ${RuleStore.blockedOf(tier.key).size} 条" +
+                    Log.i(TAG, "内置规则加载完成：${tier.label} $n 条" +
                         " / 放行 ${RuleStore.allowedOf(tier.key).size} 条")
                     reloadRules()
                 }
@@ -513,6 +543,18 @@ class LocalVpnService : VpnService() {
     private fun onBlocked(name: String, rule: String, source: RuleSource) {
         Counters.add(blocked = 1L)
         BlockLog.record(name, rule, source)
+        // 「过滤规则命中来源」按名单累计次数，界面上能看出是哪一层规则在干活。
+        RunStats.onBlocked(source.label)
+        RunStats.refresh()
+        // 前台通知顺带刷新今日数据；节流，避免每个包都重建通知。
+        if (Counters.today.value.second % 20L == 0L) refreshNotification()
+    }
+
+    private fun refreshNotification() {
+        runCatching {
+            getSystemService(NotificationManager::class.java)
+                ?.notify(NOTIF_ID, buildNotification())
+        }
     }
 
     private fun stopTunnel() {
@@ -545,10 +587,18 @@ class LocalVpnService : VpnService() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+        val (q, b) = Counters.today.value
+        val encrypt = if (prefs.leakGuard || prefs.upstreamMode == "doh") "加密上游" else "系统上游"
+        // 前台通知本身就是「运行状态自检」的最外层：不用打开 App 也能看出
+        // 服务是不是在跑、今天拦了多少、上游走的是不是加密通道。
+        val text = "运行中 · 今日查询 $q / 拦截 $b · $encrypt"
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle(getString(R.string.notif_title))
-            .setContentText(getString(R.string.notif_text))
+            .setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(
+                "$text\n仅接管 DNS，不转发应用流量；点击可查看运行状态与自检结果。",
+            ))
             .setContentIntent(pi)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)

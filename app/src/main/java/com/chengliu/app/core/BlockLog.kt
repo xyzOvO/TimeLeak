@@ -1,6 +1,7 @@
 package com.chengliu.app.core
 
 import com.chengliu.app.data.ServiceCatalog
+import com.chengliu.app.data.ServiceExplainer
 import com.chengliu.app.data.ServiceInfo
 import com.chengliu.app.data.ServiceKind
 
@@ -21,6 +22,10 @@ data class BlockHit(
     val count: Long,
     val lastAt: Long,
     val source: RuleSource,
+    /** 这份规则是哪来的：随规则文件头与订阅列表实时生成，不写死在代码里。 */
+    val origin: String,
+    /** 归属说明的公开依据；空表示按形态推断，没有归属资料。 */
+    val evidence: String = "",
 ) {
     val domainText: String
         get() = when (domains.size) {
@@ -38,6 +43,8 @@ data class BlockHit(
  *   1) 只在内存，进程结束即消失，不写 SharedPreferences、不写文件；
  *   2) 只保留聚合后的服务名与最多 3 个示例域名，不保留完整查询序列；
  *   3) 用户可以一键清空，也可以在「拦截记录」页关掉这项记录。
+ *
+ * 说明文字全部由本地的手工说明库 / 域名词根推断生成，不联网、不上传。
  */
 object BlockLog {
 
@@ -50,14 +57,17 @@ object BlockLog {
     @Volatile
     var enabled: Boolean = true
 
+    /**
+     * 桶里只存「命中了什么、属于哪一层名单」这些原始事实。
+     * origin 是**命中当时**的来源快照：切档位、换订阅后旧记录不能改口说成
+     * 一份当时根本没生效的名单。当前生效的是哪批规则，由页面底部实时显示。
+     */
     private class Bucket(
         val key: String,
-        val name: String,
-        val owner: String,
-        val kind: ServiceKind,
-        val what: String,
-        val why: String,
+        val queryName: String,
+        val rule: String,
         val source: RuleSource,
+        val origin: String,
     ) {
         var count: Long = 0
         var lastAt: Long = 0
@@ -86,16 +96,15 @@ object BlockLog {
         synchronized(lock) {
             val b = buckets[key] ?: Bucket(
                 key = key,
-                name = info?.name ?: rule,
-                owner = info?.owner ?: source.label,
-                kind = info?.kind ?: ServiceKind.OTHER,
-                what = info?.what ?: "不在内置说明库里，无法确定它具体做什么",
-                why = info?.why ?: unknownWhy(source),
+                queryName = queryName,
+                rule = rule,
                 source = source,
+                origin = SourceInfo.originOf(source),
             ).also { buckets[key] = it }
             b.count += 1
             b.lastAt = now
-            if (b.domains.size < SAMPLE_DOMAINS) b.domains.add(rule)
+            // 记实际被拦的完整域名，不是命中的父域规则：用户要看的是「刚才谁连了这里」
+            if (b.domains.size < SAMPLE_DOMAINS) b.domains.add(queryName)
             if (buckets.size > LIMIT) {
                 buckets.entries
                     .minByOrNull { it.value.lastAt }
@@ -122,6 +131,12 @@ object BlockLog {
         }
     }
 
+    /** 来源变化后重新发布一次：让页面底部的「当前生效的规则」刷新。计数、示例域名、命中时来源都不动。 */
+    fun republish() {
+        main.removeCallbacks(publishTask)
+        main.post(publishTask)
+    }
+
     private fun publish() {
         synchronized(lock) {
             lastPublish = System.currentTimeMillis()
@@ -131,25 +146,43 @@ object BlockLog {
 
     private fun publishLocked() {
         _hits.value = buckets.values.map {
+            val d = describe(it.queryName, it.rule)
             BlockHit(
                 key = it.key,
-                name = it.name,
-                owner = it.owner,
-                kind = it.kind,
-                what = it.what,
-                why = it.why,
+                name = d.name,
+                owner = d.owner,
+                kind = d.kind,
+                what = d.what,
+                why = d.why,
                 domains = it.domains.toList(),
                 count = it.count,
                 lastAt = it.lastAt,
                 source = it.source,
+                origin = it.origin,
+                evidence = d.evidence,
             )
         }.sortedByDescending { it.lastAt }
     }
 
-    private fun unknownWhy(source: RuleSource): String = when (source) {
-        RuleSource.SUBSCRIPTION -> "这条来自你导入的规则集，规则作者把它列为广告或追踪域名。"
-        RuleSource.CUSTOM -> "你自己把它加进了拦截名单。"
-        RuleSource.BUILTIN -> "内置规则里有它，但没有对应的服务说明。"
-        RuleSource.UNKNOWN -> "来源不明，建议核对后再决定是否放行。"
+    private class Desc(
+        val name: String,
+        val owner: String,
+        val kind: ServiceKind,
+        val what: String,
+        val why: String,
+        val evidence: String,
+    )
+
+    /**
+     * 有公开依据的说明表优先（人工核实 → 随规则生成的厂商族 / 上游争议标注）；
+     * 都没有才按域名词根与形态给一份标明「推断、未核实」的兜底说明。
+     */
+    private fun describe(queryName: String, rule: String): Desc {
+        val info = ServiceCatalog.lookup(queryName) ?: ServiceCatalog.lookup(rule)
+        if (info != null) {
+            return Desc(info.name, info.owner, info.kind, info.what, info.why, info.evidence)
+        }
+        val g = ServiceExplainer.guess(queryName, rule)
+        return Desc(g.name, g.owner, g.kind, g.what, g.why, "")
     }
 }

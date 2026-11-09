@@ -57,6 +57,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.core.content.FileProvider
 import com.chengliu.app.BuildConfig
+import com.chengliu.app.core.RunStats
+import com.chengliu.app.core.SourceInfo
 import com.chengliu.app.core.UpdateChecker
 import kotlinx.coroutines.Job
 import java.io.File
@@ -68,6 +70,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Counters.init(this)
+        RunStats.init(this)
+        // 服务没启动时也要能显示规则来源（打开拦截记录页即是最新的一批规则）
+        SourceInfo.refresh(this, AppPrefs(this))
 
         vpnLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             if (result.resultCode == RESULT_OK) {

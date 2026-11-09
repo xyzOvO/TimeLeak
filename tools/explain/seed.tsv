@@ -1,0 +1,62 @@
+﻿# 已核实的域名说明种子表（Tab 分隔）
+# 列：suffix / name / owner / kind / what / why / evidence
+# 规矩：只写能拿出公开依据的条目。查不到运营方的随机域名不要往这里塞，
+#       交给 ServiceExplainer 按形态说明，绝不编造公司名或业务。
+# kind 取值：AD / TRACK / ATTRIB / TELEMETRY / PCDN / NONAD / CDN / FAMILY / OTHER
+# 每次更新规则或订阅后跑 tools/explain/build_catalog.py 重新生成。
+# 宽后缀（如 yximgs.com）下面若有用途明确不同的子域，必须单独登记更精确的一条，
+# 否则最长后缀匹配会把广告子域也说成 CDN / PCDN。
+firebaselogging.googleapis.com	Firebase 日志上报	Google	TELEMETRY	App 把性能数据与事件日志批量发回 Firebase（Performance Monitoring / Analytics）	上报里带设备标识、IP 与事件时间戳，属于后台行为采集；拦掉不影响 App 正常功能	Firebase 官方文档：出现对该域名的请求，即表示正在向 Firebase 发送成效数据
+firebaselogging-pa.googleapis.com	Firebase 日志上报	Google	TELEMETRY	Firebase 日志上报的另一个端点，用途同上	同上，属于后台行为采集	Firebase 官方文档（同族 -pa 变体）
+yximgs.com	快手内容分发 CDN	快手（北京快手科技）	PCDN	快手 / 极速版的音视频与图片分发；*.pull.yximgs.com 是拉流 CDN，*-ad.a.yximgs.com 才带广告素材	这条通常不是广告。anti-AD 把 pcdn.yximgs.com 列入争议 PCDN 清单，意在阻止 App 后台占用你的上行带宽给别人分发内容；拦掉可能影响快手视频与直播加载	Netify 域名库把 *.yximgs.com 关联到 Kwai / 腾讯云 CDN；anti-AD discretion/pcdn.txt
+ali-ad.a.yximgs.com	快手广告素材	快手（北京快手科技）	AD	快手 / 极速版的广告图片与视频素材，子域名里的 -ad 就是广告	这是广告素材地址，和 PCDN 拉流域名不是同一类；拦掉只影响广告展示，不影响视频播放	anti-AD 规则原文中该子域命名为 -ad.a.yximgs.com
+hw-ot-ad.a.yximgs.com	快手广告素材	快手（北京快手科技）	AD	快手 / 极速版的广告图片与视频素材，子域名里的 -ad 就是广告	这是广告素材地址，和 PCDN 拉流域名不是同一类；拦掉只影响广告展示，不影响视频播放	anti-AD 规则原文中该子域命名为 -ad.a.yximgs.com
+tx-ad.a.yximgs.com	快手广告素材	快手（北京快手科技）	AD	快手 / 极速版的广告图片与视频素材，子域名里的 -ad 就是广告	这是广告素材地址，和 PCDN 拉流域名不是同一类；拦掉只影响广告展示，不影响视频播放	anti-AD 规则原文中该子域命名为 -ad.a.yximgs.com
+js-ad.a.yximgs.com	快手广告素材	快手（北京快手科技）	AD	快手 / 极速版的广告图片与视频素材，子域名里的 -ad 就是广告	这是广告素材地址，和 PCDN 拉流域名不是同一类；拦掉只影响广告展示，不影响视频播放	anti-AD 规则原文中该子域命名为 -ad.a.yximgs.com
+v1-ad.video.yximgs.com	快手视频广告素材	快手（北京快手科技）	AD	快手视频播放前贴片广告的素材地址	这是广告素材地址，和 PCDN 拉流域名不是同一类；拦掉只影响广告，不影响正片	anti-AD 规则原文中该子域命名为 -ad.video.yximgs.com
+v2-ad.video.yximgs.com	快手视频广告素材	快手（北京快手科技）	AD	快手视频播放前贴片广告的素材地址	这是广告素材地址，和 PCDN 拉流域名不是同一类；拦掉只影响广告，不影响正片	anti-AD 规则原文中该子域命名为 -ad.video.yximgs.com
+v3-ad.video.yximgs.com	快手视频广告素材	快手（北京快手科技）	AD	快手视频播放前贴片广告的素材地址	这是广告素材地址，和 PCDN 拉流域名不是同一类；拦掉只影响广告，不影响正片	anti-AD 规则原文中该子域命名为 -ad.video.yximgs.com
+tob-tracker.yximgs.com	快手广告追踪	快手（北京快手科技）	TRACK	名称里的 tracker 指向广告曝光与点击回传	属于广告效果统计，不是内容分发地址；拦掉不影响视频播放	anti-AD 规则原文中该子域命名为 tob-tracker.yximgs.com
+4004outstatistics.net	广告投放统计域名（仅站点自述）	未公开 · WHOIS 隐藏	TRACK	站点自称是「广告投放完整性与反作弊基础设施」，名称含 statistics；2026 年新注册、走 Cloudflare	归属无法独立核实，只有站点自己的说法；因名称与广告统计相关被名单收录	站点自述 + Scamadviser 的 WHOIS 记录
+cloudfront.net	AWS CloudFront CDN	Amazon	CDN	公共 CDN 上的自定义子域，具体用途取决于接入它的那个站点	名单因广告或追踪用途收录了其中部分子域；单看域名判断不出是哪家、做什么	AWS CloudFront 公开产品说明
+akamaized.net	Akamai CDN	Akamai	CDN	公共 CDN 上的自定义子域	同上，归属能确认，具体用途要看接入方	Akamai 公开产品说明
+googleapis.com	Google API 域名族	Google	CDN	Google 各类 API 的统一起名，里面既有 Firebase 上报，也有广告 SDK，用途混合	具体用途要看子域；这条只说明它落在 Google 的域名族里	Google API 域名命名规则
+qq.com	腾讯域名族	腾讯	FAMILY	腾讯自有域名下的各类子域，名单因广告、统计或上报用途收录了其中一部分	归属能确认，但具体哪个子域做什么没有逐条核实；若某个功能受影响，可把对应域名加入放行名单	注册域归属为公开信息；具体子域见当前规则文件
+baidu.com	百度域名族	百度	FAMILY	百度自有域名下的各类子域，含广告联盟与统计埋点	归属能确认，具体用途未逐条核实；放行单个子域不会影响整份名单	注册域归属为公开信息；具体子域见当前规则文件
+baidu.cn	百度域名族	百度	FAMILY	百度 .cn 域名下的广告与统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+windows.com	微软 Windows 域名族	Microsoft	FAMILY	Windows 系统服务的通知、遥测与更新子域	归属能确认；其中部分子域涉及系统通知，拦掉可能影响推送，具体用途未逐条核实	注册域归属为公开信息；anti-AD discretion 也提示过同类误伤
+microsoft.com	微软域名族	Microsoft	FAMILY	微软自有域名下的广告 SDK、Bing 与遥测子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+msn.com	MSN 域名族	Microsoft	FAMILY	MSN 门户的广告与内容推荐子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+adobe.com	Adobe 域名族	Adobe	FAMILY	Adobe 官网与软件服务的营销、激活、统计子域	归属能确认；拦掉部分子域可能影响软件激活与更新，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+youku.com	优酷域名族	阿里巴巴	FAMILY	优酷播放、广告与数据上报子域	归属能确认；拦掉部分子域可能影响视频播放，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+taobao.com	淘宝域名族	阿里巴巴	FAMILY	淘宝 App 的广告、埋点与接口子域	归属能确认；部分子域与商品页、验证码有关，放行需具体到子域	anti-AD discretion 对同族 mmstat.com 有明确误伤提示
+aliyuncs.com	阿里云 OSS 域名族	阿里巴巴	FAMILY	阿里云对象存储与移动分析服务的自定义子域	归属能确认，但每个存储桶属于谁、放什么内容无法从域名判断	阿里云产品说明；桶名由接入方自定义
+alicdn.com	阿里 CDN 域名族	阿里巴巴	FAMILY	阿里 CDN 上的广告素材与统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+tanx.com	阿里妈妈 TanX	阿里巴巴	AD	淘宝联盟的广告竞价市场	把你正在打开的页面实时拿去拍卖，谁出价高就展示谁的广告	阿里妈妈公开产品说明
+360.cn	360 域名族	360	FAMILY	360 手机助手、浏览器等产品的广告与统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+sogou.com	搜狗域名族	搜狗	FAMILY	搜狗输入法与搜索的广告、词库、统计子域	归属能确认；其中部分子域与词库同步有关，拦掉可能影响输入法功能	anti-AD discretion 对 shouji.sogou.com 有明确误伤提示
+jd.com	京东域名族	京东	FAMILY	京东商城的广告联盟、埋点与风控子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+sohu.com	搜狐域名族	搜狐	FAMILY	搜狐门户与视频的广告、统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+163.com	网易域名族	网易	FAMILY	网易门户、邮箱与游戏的广告、统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+amazonaws.com	AWS 域名族	Amazon	CDN	AWS 上的自定义接口与存储子域	归属能确认，但每个地址属于谁、做什么只有接入方知道	AWS 公开产品说明；子域名由客户自定义
+iqiyi.com	爱奇艺域名族	爱奇艺	FAMILY	爱奇艺播放、广告与内置 DNS 子域	归属能确认；拦掉部分子域可能影响视频播放，具体用途未逐条核实	注册域归属为公开信息；anti-AD discretion/dns.txt 收录了同族域名
+kugou.com	酷狗域名族	腾讯音乐	FAMILY	酷狗音乐的资源、广告与统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+snssdk.com	字节跳动域名族	字节跳动	FAMILY	抖音、今日头条等 App 的日志、实验与广告接口	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+yahoo.com	Yahoo 域名族	Yahoo	FAMILY	Yahoo 门户与广告平台的子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+mgtv.com	芒果 TV 域名族	芒果 TV	FAMILY	芒果 TV 播放、广告与数据上报子域	归属能确认；拦掉部分子域可能影响视频播放	注册域归属为公开信息；具体子域见当前规则文件
+sina.cn	新浪域名族	新浪	FAMILY	新浪移动端的广告与统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+sina.com.cn	新浪域名族	新浪	FAMILY	新浪门户的广告与统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+autohome.com.cn	汽车之家域名族	汽车之家	FAMILY	汽车之家 App 与网站的广告、统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+samsung.com	三星域名族	Samsung	FAMILY	三星设备与服务的营销、统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+miui.com	MIUI 域名族	小米	FAMILY	MIUI 系统组件的广告、统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+vivo.com.cn	vivo 域名族	vivo	FAMILY	vivo 系统服务的广告与统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+ucweb.com	UC 域名族	阿里巴巴	FAMILY	UC 浏览器的广告、追踪与视频接口	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+ifeng.com	凤凰网域名族	凤凰网	FAMILY	凤凰网门户的广告与统计子域	归属能确认，具体用途未逐条核实	注册域归属为公开信息；具体子域见当前规则文件
+appspot.com	Google App Engine	Google	CDN	开发者托管在 Google App Engine 上的自定义应用域名	归属能确认，但每个应用是谁做的、做什么无法从域名判断	Google Cloud 公开产品说明；应用名由开发者自定义
+sdkoptedge.chinanetcenter.com	网宿 HTTPDNS	网宿科技（ChinaNetCenter / CDNetworks）	NONAD	App 内置 SDK 用它做 HTTPDNS 域名解析，是网宿 CDN 的 SDK 优化边缘节点，不是广告地址	这条不是广告。拦它是因为 App 自带解析会绕开系统 DNS，可能连带绕过 DNS 广告过滤；放行后 CDN 调度更准，代价是过滤可能漏网	网宿/CDNetworks 官方 API 文档「获取视频上传令牌」返回 httpDnsServer: https://sdkoptedge.chinanetcenter.com；看雪论坛 App 抓包把它列入拦截名单
+dataflow.biliapi.com	B 站数据上报	哔哩哔哩（上海幻电信息科技）	TRACK	哔哩哔哩客户端的后台数据上报端点；抓包看到打开、退出评论等操作都会向它发送加密数据	不是广告素材，属于客户端行为采集，anti-AD 等 DNS 名单把它列为需要拦截的地址	biliapi.com 备案主体为上海幻电信息科技有限公司；Stage1st 论坛抓包讨论（B 站未公开说明该端点）
+ugdtimg.com	腾讯广告素材域名	腾讯（广点通 / 优量汇）	AD	腾讯广告的图片、视频素材分发域名族，adsmind、pgdt 等子域用于加载信息流与激励视频广告	广告素材与广告请求地址，拦掉只影响广告展示，不影响 App 正常功能	腾讯广告优量汇官方开发者文档以 gdtimg.com 承载广告 SDK 与素材；同族 ugdtimg.com 的 adsmind / pgdt 子域见 neohosts 与看雪抓包记录（非官方端点说明）
+gdtimg.com	腾讯广告 SDK 与素材	腾讯（广点通 / 优量汇）	AD	腾讯广告的图片、脚本与视频素材域名；qzs.gdtimg.com 承载优量汇 H5 广告 SDK，adsmind、public 等子域用于广告素材	广告 SDK 与素材地址，拦掉只影响广告展示与加载，不影响 App 正常功能	腾讯广告优量汇官方开发者文档（developers.adnet.qq.com）明确以 qzs.gdtimg.com 提供 H5 SDK；素材子域见 neohosts 抓包记录
+apd-pcdnwxstat.teg.tencent-cloud.net	腾讯云 PCDN 统计	腾讯云（TEG）	PCDN	名字里的 pcdn 与 stat 指向腾讯云 PCDN 的统计 / 调度端点，同族还有 pcdnwxlogin；腾讯未公开说明具体业务	这条不是广告。anti-AD 把它列在 PCDN 相关规则里，意在阻止 App 后台占用上行带宽；具体影响未核实	anti-AD 强档规则原文；NodeSeek 社区讨论（一致认为是 PCDN，无官方说明）
+beacons.gvt2.com	Google 域名可靠性上报	Google	TELEMETRY	Chrome 等 Google 客户端把请求成功 / 失败的可靠性采样（beacon）周期性上报到这里，用于统计网络错误与连通性	不是广告，属于后台遥测；拦掉一般不影响网页加载与账号同步，只会少一份网络质量统计	Google「Domain Reliability Monitoring」设计文档把 https://beacons.gvt2.com/domainreliability/upload 列为 collector；gvt2.com 为 Google 自有域名
+teg.tencent-cloud.net	腾讯云 TEG 域名族	腾讯云（TEG）	FAMILY	腾讯云 TEG 下的 PCDN 相关子域；规则里并列的 pcdnwxlogin、pcdnwxnat、pcdnwxstat 按名称像是登录、NAT 探测与统计端点	归属能确认，具体用途未逐条核实；不是广告地址，被名单收录多与 PCDN 占用上行带宽有关	anti-AD 强档规则原文（三条连号规则）；NodeSeek 社区讨论（无腾讯官方说明）

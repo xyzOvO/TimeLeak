@@ -76,6 +76,68 @@ object SkipSources {
     }
 
     /**
+     * 广告 SDK 的「关闭」控件 id。
+     *
+     * 只收带 ad / splash / SDK 前缀的命名，不收泛化的 `close_btn`、`iv_close`：
+     * 后者在普通对话框里遍地都是，点掉的就是用户自己要用的功能。
+     */
+    private val SDK_CLOSE_TOKENS: List<String> = listOf(
+        "ad_close", "close_ad", "splash_close", "splash_x", "tt_splash_close",
+        "ksad_close", "gdt_close", "banner_close", "interstitial_close",
+        "promotion_close", "ad_x_btn", "ad_close_btn", "close_promotion",
+    )
+
+    /** 该控件 id 是否属于广告 SDK 的关闭按钮（含 DENY 过滤）。 */
+    fun sdkCloseHit(viewId: String): Boolean {
+        if (viewId.isEmpty()) return false
+        val seg = viewId.substringAfterLast('/').lowercase()
+        if (seg.length < 4 || seg.length > 64) return false
+        for (d in SDK_ID_DENY) if (seg.contains(d)) return false
+        for (t in SDK_CLOSE_TOKENS) if (seg.contains(t)) return true
+        return false
+    }
+
+    /**
+     * 「明确的广告关闭信号」——应用内弹窗轮唯一的入场券。
+     * 纯 `×` 图标不算：信息流「不感兴趣」、图片关闭、购物车移除都长这样。
+     */
+    private val EXPLICIT_AD_CLOSE = listOf(
+        "关闭广告", "关闭此广告", "关闭该广告", "广告关闭", "跳过广告", "跳过此广告",
+        "关闭推广", "关闭该推广", "推广关闭", "关闭插屏", "跳过推广",
+        "close ad", "skip ad", "skip ads", "close advertisement",
+    )
+
+    fun explicitAdClose(text: String, desc: String, id: String): Boolean {
+        if (sdkCloseHit(id)) return true
+        for (raw in arrayOf(text, desc)) {
+            val s = raw.trim().lowercase()
+            if (s.isEmpty() || s.length > 12) continue
+            if (EXPLICIT_AD_CLOSE.any { s.contains(it) }) return true
+        }
+        return false
+    }
+
+    /**
+     * 四角关闭按钮：不写死「右上角」，允许不同 App 把按钮放在任意一角。
+     * 但仍要求控件够小 —— 大面积的「×」多半是内容区，不是角落里的跳过按钮。
+     */
+    fun closeCornerHit(
+        s: String,
+        left: Int, top: Int, right: Int, bottom: Int,
+        screenW: Int, screenH: Int,
+    ): Boolean {
+        val t = s.trim()
+        if (t != "×" && t != "✕" && t != "x" && t != "X" && t != "✖" && t != "关闭") return false
+        if (screenW <= 0 || screenH <= 0) return false
+        if (right - left > screenW * 0.16f || bottom - top > screenH * 0.10f) return false
+        val nearLeft = right < screenW * 0.30f
+        val nearRight = left > screenW * 0.70f
+        val nearTop = top < screenH * 0.30f
+        val nearBottom = bottom > screenH * 0.78f
+        return (nearLeft || nearRight) && (nearTop || nearBottom)
+    }
+
+    /**
      * 纯图标关闭按钮（"×" / "✕" / "X"）。
      * 只在开屏时间窗内、且位于屏幕右上角时才算数 —— 中间一个大叉多半是
      * 弹窗的「关闭内容」，不是广告的跳过。

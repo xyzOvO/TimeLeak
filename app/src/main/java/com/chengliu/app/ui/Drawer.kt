@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -28,6 +29,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.chengliu.app.BuildConfig
+import com.chengliu.app.core.AppPrefs
 
 @Composable
 fun AppDrawerContent(
@@ -37,6 +39,10 @@ fun AppDrawerContent(
     onCheckUpdate: () -> Unit,
 ) {
     val ui = LocalUi.current
+    val ctx = LocalContext.current
+    val prefs = remember { AppPrefs(ctx) }
+    // 侧栏也给一个状态标：不用进页面就能看出跳过广告到底开没开
+    val skipStatus = rememberSkipAdStatus(prefs.skipAdEnabled)
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -65,28 +71,36 @@ fun AppDrawerContent(
             Spacer(Modifier.height(24.dp))
             // 按 key 分组，不再写死下标：以后加页面不会错位
             val groups = listOf(
-                listOf("home", "blocklog", "rules"),
-                listOf("upstream", "shield"),
-                listOf("blocked", "allowed", "subs", "skipad"),
+                listOf("home", "overview", "blocklog", "rules"),
+                listOf("upstream", "shield", "health", "subs", "subguard"),
+                listOf("blocked", "allowed", "skipad", "apprules", "observe"),
             )
             groups.forEachIndexed { index, keys ->
                 if (index > 0) DrawerDivider()
                 for (key in keys) {
                     val item = navItem(key)
-                    DrawerRow(item, current == item.key) { onNavigate(item.key) }
+                    val badge = if (key == "skipad") skipStatus.status.shortLabel() else null
+                    val badgeColor = when (skipStatus.status) {
+                        SkipAdStatus.RUNNING -> ui.active
+                        SkipAdStatus.OFF -> ui.sub
+                        else -> ui.warn
+                    }
+                    DrawerRow(item, current == item.key, { onNavigate(item.key) }, badge, badgeColor)
                 }
             }
             DrawerDivider()
             val about = navItem("about")
-            DrawerRow(about, current == about.key) { onNavigate(about.key) }
+            val privacy = navItem("privacy")
+            DrawerRow(about, current == about.key, onClick = { onNavigate(about.key) })
+            DrawerRow(privacy, current == privacy.key, onClick = { onNavigate(privacy.key) })
             DrawerDivider()
-            DrawerRow(NavItem("update", "检查更新", Glyph.UPDATE, ui.sub), false) { onCheckUpdate() }
-            DrawerRow(navItem("theme"), false) { onThemeClick() }
+            DrawerRow(NavItem("update", "检查更新", Glyph.UPDATE, ui.sub), false, onClick = { onCheckUpdate() })
+            DrawerRow(navItem("theme"), false, onClick = { onThemeClick() })
 
             Spacer(Modifier.height(20.dp))
             // 版本号统一走 BuildConfig，避免手写成「1.1.4」和关于页对不上
             Text(
-                "Time Leak ${BuildConfig.VERSION_NAME} · 完全原创实现",
+                "Time Leak ${BuildConfig.VERSION_NAME}",
                 fontSize = 11.sp,
                 color = ui.sub,
             )
@@ -110,7 +124,6 @@ fun AppDrawerContent(
             Spacer(Modifier.height(12.dp))
             Text("来自—xyzOvO", fontSize = 11.sp, color = ui.sub)
             Spacer(Modifier.height(6.dp))
-            val ctx = LocalContext.current
             Text(
                 "github.com/xyzOvO/TimeLeak",
                 fontSize = 11.sp,
@@ -137,7 +150,13 @@ fun AppDrawerContent(
 private const val REPO_URL = "https://github.com/xyzOvO/TimeLeak"
 
 @Composable
-private fun DrawerRow(item: NavItem, selected: Boolean, onClick: () -> Unit) {
+private fun DrawerRow(
+    item: NavItem,
+    selected: Boolean,
+    onClick: () -> Unit,
+    badge: String? = null,
+    badgeColor: Color? = null,
+) {
     val ui = LocalUi.current
     Row(
         verticalAlignment = Alignment.CenterVertically,
@@ -157,6 +176,10 @@ private fun DrawerRow(item: NavItem, selected: Boolean, onClick: () -> Unit) {
             fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
             color = if (selected) ui.text else ui.text.copy(alpha = 0.86f),
         )
+        if (badge != null) {
+            Spacer(Modifier.weight(1f))
+            Text(badge, fontSize = 10.sp, color = badgeColor ?: ui.sub)
+        }
     }
 }
 

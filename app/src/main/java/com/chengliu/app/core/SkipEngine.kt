@@ -164,18 +164,26 @@ object SkipEngine {
     /** 上下文明确的强信号，几乎不可能是正文。 */
     private val STRONG = listOf(
         "跳过广告", "点击跳过", "跳过此页", "跳过开屏", "广告跳过", "跳过提示",
-        "跳过此广告", "跳过该广告", "关闭广告", "skip ad", "skip ads", "skip this ad",
+        "跳过此广告", "跳过该广告", "关闭广告", "关闭此广告", "关闭该广告",
+        "关闭推广", "跳过推广", "skip ad", "skip ads", "skip this ad", "close ad",
     )
 
     /**
-     * 只认「跳过」本身，或带倒计时：`跳过`、`跳过 3`、`跳过3s`、`跳过(3)`、`skip 5`。
+     * 只认「跳过」本身，或带倒计时：`跳过`、`跳过 3`、`跳过3s`、`跳过(3)`、`skip 5`、
+     * 以及倒计时归零后的 `跳过 0s`、`跳过 >`。
      * 后面跟任何别的字都不算 —— 正文里的「跳过本章」「跳过验证」都是用户
      * 真正想点的功能，点掉就是事故。
      */
-    private val BARE_SKIP = Regex("^(跳过|skip)\\s*[（(]?\\s*\\d*\\s*[s秒]?\\s*[)）]?$")
+    private val BARE_SKIP = Regex(
+        """^(跳过|skip)\s*[（(]?\s*\d*\s*[s秒]?\s*[)）]?\s*[>»›→]?$""",
+    )
 
     /** 否定式 / 明显是正文的措辞，命中就不该点。 */
-    private val NEG = listOf("不可", "无法", "不能", "跳过片", "跳过剧", "跳过章节")
+    private val NEG = listOf(
+        "不可", "无法", "不能", "跳过片", "跳过剧", "跳过章节",
+        "跳过本次", "跳过此步", "跳过此章", "跳过片头", "跳过片尾",
+        "跳过设置向导", "跳过此流程", "不再提示",
+    )
 
     private val ID_SKIP = Regex("(^|[_-])(skip|skipad|adskip|splashskip|tvskip|btnskip)($|[_-])")
 
@@ -242,6 +250,30 @@ object SkipEngine {
         return null
     }
 
+    /**
+     * 命中的是不是**全局组**（订阅里没写包名的通用规则）。
+     * 全局规则只在前几秒生效，评分时会额外扣分；单独判一次是为了不把
+     * 「带包名作用域」和「全局兜底」混成同一种证据。
+     */
+    fun globalHit(
+        text: String,
+        desc: String,
+        id: String,
+        windowAgeMs: Long,
+        cls: String = "",
+    ): Boolean {
+        if (windowAgeMs > GLOBAL_MAX_MS) return false
+        for (g in snap.groups) {
+            if (g.pkg != null) continue
+            if (windowAgeMs > minOf(g.matchTimeMs, GLOBAL_MAX_MS)) continue
+            for (r in g.rules) {
+                if (r.excludes.any { it.hit(text, desc, id, cls) }) continue
+                if (r.specs.any { it.hit(text, desc, id, cls) }) return true
+            }
+        }
+        return false
+    }
+
     /** 按包名过滤后的规则组缓存：几百组订阅里通常只有 1~3 组和当前应用有关。 */
     private var cachePkg: String? = null
     private var cacheSnap: Snapshot? = null
@@ -275,6 +307,10 @@ object SkipEngine {
         "立即下载", "下载", "安装", "体验", "打开", "查看详情", "了解更多", "详情",
         "领取", "购买", "加入购物车", "进入游戏", "开始游戏", "预约", "参与", "报名",
         "同意并继续", "同意并接受", "授权", "开启", "去开通", "升级", "更新",
+        // 付费 / 下载广告、激励视频的常见 CTA
+        "立即打开", "马上抢", "去购买", "下单", "立即开通", "立即领取", "免费领",
+        "看视频", "去领取", "打开应用", "进入小程序", "咨询客服", "立即咨询",
+        "去查看", "去看看", "立即体验", "立即安装", "获取", "抢购", "立即预约",
     )
 
     /**
@@ -288,11 +324,105 @@ object SkipEngine {
         "跳过教程", "跳过引导", "跳过练习", "跳过测试", "跳过步骤",
         "跳过设置", "跳过问卷", "跳过答题", "跳过检查", "跳过更新",
         "跳过安装", "跳过备份", "跳过恢复", "跳过同步", "跳过下载",
+        "跳过本次", "跳过此步", "跳过此章", "跳过片头", "跳过片尾", "跳过此流程",
+        // 「关闭 XX」在正文里几乎都是用户自己的设置，不能当成广告关闭
+        "关闭通知", "关闭提醒", "关闭引导", "关闭教程", "关闭说明", "关闭设置",
+        "关闭定位", "关闭推送", "关闭自动", "关闭省电", "关闭夜间", "关闭护眼",
+        "关闭推荐", "关闭浮层", "关闭提示", "不感兴趣", "减少此类",
     )
 
     /** 自定义 keywords 规则（全局，仅开屏窗口生效）。 */
     fun customHit(text: String, desc: String, id: String, cls: String = ""): Boolean =
         snap.keywords.any { it.hit(text, desc, id, cls) }
+
+    // ---------------- 广告类型识别 ----------------
+
+    /**
+     * 激励视频：这里的「关闭」意味着放弃奖励，用户点不点是他自己的决定。
+     * 匹配范围放到 text + desc 一起看，宁可多判成 REWARDED 少点一下。
+     */
+    private val REWARDED_HINTS = listOf(
+        "激励", "领取奖励", "获得奖励", "领取金币", "领取福利", "看视频得",
+        "看视频领", "看完可得", "再看", "继续观看", "视频奖励", "免费领",
+        "reward", "earn reward", "watch to",
+    )
+
+    /** 付费 / 下载广告的 CTA：点下去是「打开广告」，方向与跳过相反。 */
+    private val PAID_HINTS = listOf(
+        "立即下载", "立即安装", "立即购买", "立即抢", "去购买", "下单",
+        "查看详情", "了解详情", "进入游戏", "开始游戏", "立即咨询",
+        "打开应用", "马上抢", "抢购", "advertisement", "sponsored",
+    )
+
+    /** 信息流卡片上的小标签；必须配合「宽控件」才判 FEED，避免误伤开屏跳过按钮。 */
+    private val FEED_LABELS = listOf("广告", "推广", "赞助", "sponsored", "advertisement")
+
+    /** 非开屏窗口里唯一认可的推广弹窗关闭文案，比 EXPLICIT_AD_CLOSE 更窄。 */
+    private val POPUP_CLOSE_TEXT = listOf(
+        "关闭广告", "关闭此广告", "关闭该广告", "广告关闭", "关闭推广",
+        "推广关闭", "关闭插屏", "close ad", "close advertisement",
+    )
+
+    /** 应用内弹窗轮的入场券：只有这些信号才允许在非开屏窗口点击。 */
+    fun explicitPopupClose(text: String, desc: String, id: String): Boolean {
+        if (SkipSources.sdkCloseHit(id)) return true
+        for (raw in arrayOf(text, desc)) {
+            val s = raw.trim().lowercase()
+            if (s.isEmpty() || s.length > 12) continue
+            if (POPUP_CLOSE_TEXT.any { s.contains(it) }) return true
+        }
+        return false
+    }
+
+    /**
+     * 对「候选点击目标」做类型判定。
+     *
+     * 顺序是故意的：先排除激励视频 / 付费广告 / 信息流这三种绝不能点的，
+     * 再看是不是开屏，最后才考虑推广弹窗。任何认不出来的都是 UNKNOWN，
+     * 而 UNKNOWN 一律不点 —— 这是「对无法确认的广告不自动点击」的落点。
+     *
+     * 开屏窗口内，订阅规则 / 自定义关键词 / 用户坐标本身也算有效证据：
+     * 它们是否放行由 [SkipPolicy] 的 textGuess / gesture 位决定，类型层不重复拦。
+     */
+    fun classify(
+        text: String,
+        desc: String,
+        id: String,
+        cls: String,
+        bounds: Rect,
+        screenW: Int,
+        screenH: Int,
+        inSplash: Boolean,
+        reason: HitReason,
+    ): AdKind {
+        val s = (text.ifEmpty { desc }).trim().lowercase()
+        val both = "$text $desc".trim().lowercase()
+
+        if (REWARDED_HINTS.any { both.contains(it) }) return AdKind.REWARDED
+        if (PAID_HINTS.any { s.contains(it) }) return AdKind.PAID
+
+        val wide = screenW > 0 && bounds.width() >= screenW * 0.45f
+        if (wide && FEED_LABELS.any { s.contains(it) } &&
+            !SkipSources.explicitAdClose(text, desc, id)
+        ) return AdKind.FEED
+
+        val corner = SkipSources.closeCornerHit(
+            (text.ifEmpty { desc }).trim(),
+            bounds.left, bounds.top, bounds.right, bounds.bottom, screenW, screenH,
+        )
+        if (inSplash) {
+            val strong = SkipSources.sdkHit(id) ||
+                SkipSources.sdkCloseHit(id) ||
+                builtinHit(text, desc, "") ||
+                SkipSources.explicitAdClose(text, desc, id) || corner
+            if (strong || reason == HitReason.SUBSCRIPTION ||
+                reason == HitReason.TEXT_GUESS || reason == HitReason.COORDINATE
+            ) return AdKind.SPLASH
+        }
+
+        if (explicitPopupClose(text, desc, id)) return AdKind.POPUP
+        return AdKind.UNKNOWN
+    }
 
     // ---------------- GKD 解析 ----------------
 

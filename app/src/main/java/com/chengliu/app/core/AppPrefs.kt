@@ -8,6 +8,7 @@ import org.json.JSONObject
 class AppPrefs(ctx: Context) {
     private val sp: SharedPreferences =
         ctx.applicationContext.getSharedPreferences("chengliu_prefs", Context.MODE_PRIVATE)
+    private val selfPkg: String = ctx.applicationContext.packageName
 
     var builtinEnabled: Boolean
         get() = sp.getBoolean(KEY_BUILTIN, true)
@@ -55,6 +56,11 @@ class AppPrefs(ctx: Context) {
             v.forEach { (k, value) -> o.put(k, value) }
             sp.edit().putString(KEY_SUB_MAP, o.toString()).apply()
         }
+
+    /** 最近一次成功刷新订阅的时间；拦截记录里用来说明「这批规则是什么时候拿到的」。 */
+    var subUpdatedAt: Long
+        get() = sp.getLong(KEY_SUB_AT, 0L)
+        set(v) = sp.edit().putLong(KEY_SUB_AT, v).apply()
 
     /** system = 系统探测；ip = 用户指定 IP；doh = 加密上游 */
     var upstreamMode: String
@@ -178,10 +184,146 @@ class AppPrefs(ctx: Context) {
             ?: ""
         set(v) = sp.edit().putString(KEY_CUSTOM_RULES, v).apply()
 
+    /**
+     * 应用级跳过策略：包名 -> PolicyMode 名称。
+     * 只存用户显式改过的条目，预置表和类别推断由 SkipPolicyStore 负责。
+     */
+    var appPolicies: Map<String, String>
+        get() {
+            val raw = sp.getString(KEY_APP_POLICIES, "") ?: ""
+            if (raw.isBlank()) return emptyMap()
+            return runCatching {
+                val o = JSONObject(raw)
+                val m = LinkedHashMap<String, String>()
+                val keys = o.keys()
+                while (keys.hasNext()) {
+                    val k = keys.next()
+                    val v = o.optString(k, "")
+                    if (k.isNotBlank() && v.isNotBlank()) m[k] = v
+                }
+                m
+            }.getOrDefault(emptyMap())
+        }
+        set(v) {
+            val o = JSONObject()
+            v.forEach { (k, mode) -> if (k.isNotBlank()) o.put(k, mode) }
+            sp.edit().putString(KEY_APP_POLICIES, o.toString()).apply()
+        }
+
     /** 摇一摇广告拦截：跳到浏览器 / 应用商店 / 电商落地页时自动返回。 */
     var shakeBlock: Boolean
         get() = sp.getBoolean("shake_block", true)
         set(v) = sp.edit().putBoolean("shake_block", v).apply()
+
+    /**
+     * 用户单独关掉「自动跳过」的包名。
+     *
+     * 和 PolicyMode.DISABLED 的区别：这里只是临时关掉，原来选的档位照旧保留，
+     * 重新打开不用再挑一遍策略。
+     */
+    var appSkipOff: Set<String>
+        get() = sp.getStringSet(KEY_APP_SKIP_OFF, emptySet())?.toSet() ?: emptySet()
+        set(v) = sp.edit().putStringSet(KEY_APP_SKIP_OFF, v.toHashSet()).apply()
+
+    /** 保护名单：无论策略是什么，一律不自动点击，也不做摇一摇回退。 */
+    var protectedApps: Set<String>
+        get() = sp.getStringSet(KEY_PROTECTED_APPS, emptySet())?.toSet() ?: emptySet()
+        set(v) = sp.edit().putStringSet(KEY_PROTECTED_APPS, v.toHashSet()).apply()
+
+    /** 最近用过的应用（包名，最近在前，最多 8 个）。只在本机，用来做快捷入口。 */
+    var recentApps: List<String>
+        get() = (sp.getString(KEY_RECENT_APPS, "") ?: "")
+            .split('\n')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .take(RECENT_MAX)
+        set(v) = sp.edit()
+            .putString(KEY_RECENT_APPS, v.distinct().take(RECENT_MAX).joinToString("\n"))
+            .apply()
+
+    /** 记录一次前台切换。低频（只在窗口变化时），直接 apply 不阻塞。 */
+    fun recordRecentApp(pkg: String) {
+        if (pkg.isEmpty() || pkg == selfPkg) return
+        val old = recentApps
+        if (old.firstOrNull() == pkg) return
+        recentApps = listOf(pkg) + old.filter { it != pkg }
+    }
+
+    // ---------------- 安全观察 / 自检 / 订阅安全 ----------------
+
+    /**
+     * 安全观察模式：只识别规则、只记录，绝不执行点击。
+     * 默认关闭是为了不让升级用户的功能静默失效；界面顶部提供一键切换，
+     * 建议先开观察模式确认命中详情，再切回自动执行。
+     */
+    var observeMode: Boolean
+        get() = sp.getBoolean(KEY_OBSERVE, false)
+        set(v) = sp.edit().putBoolean(KEY_OBSERVE, v).apply()
+
+    /** 开机后恢复 VPN 过滤；仍受恢复预算约束，且未授权时绝不弹系统窗口。 */
+    var bootRestore: Boolean
+        get() = sp.getBoolean(KEY_BOOT_RESTORE, false)
+        set(v) = sp.edit().putBoolean(KEY_BOOT_RESTORE, v).apply()
+
+    /** 服务异常时允许发一条通知提醒；同一问题不会反复弹。 */
+    var healthNotify: Boolean
+        get() = sp.getBoolean(KEY_HEALTH_NOTIFY, true)
+        set(v) = sp.edit().putBoolean(KEY_HEALTH_NOTIFY, v).apply()
+
+    /** 订阅来源白名单：不在表里的地址必须经用户确认才能下载。 */
+    var subWhitelist: Set<String>
+        get() = (sp.getStringSet(KEY_SUB_WHITELIST, null) ?: defaultSources()).toSet()
+        set(v) = sp.edit().putStringSet(KEY_SUB_WHITELIST, v.toHashSet()).apply()
+
+    /** 每个订阅来源最近一次「已确认可用」的正文，用于一键回滚。 */
+    var subGoodMap: Map<String, String>
+        get() = readMap(KEY_SUB_GOOD)
+        set(v) = writeMap(KEY_SUB_GOOD, v)
+
+    /** 来源 -> 指纹元数据（sha256 / 条数 / 时间），界面用来做来源标识。 */
+    var subMeta: Map<String, String>
+        get() = readMap(KEY_SUB_META)
+        set(v) = writeMap(KEY_SUB_META, v)
+
+    /** 最近一次订阅更新的失败原因，空串表示成功。 */
+    var subError: String
+        get() = sp.getString(KEY_SUB_ERROR, "") ?: ""
+        set(v) = sp.edit().putString(KEY_SUB_ERROR, v).apply()
+
+    /** 最近一次规则加载错误，空串表示成功。 */
+    var ruleLoadError: String
+        get() = sp.getString(KEY_RULE_ERROR, "") ?: ""
+        set(v) = sp.edit().putString(KEY_RULE_ERROR, v).apply()
+
+    /** 订阅更新是否自动应用；默认关：先看差异预览，用户确认后才替换。 */
+    var subAutoApply: Boolean
+        get() = sp.getBoolean(KEY_SUB_AUTO_APPLY, false)
+        set(v) = sp.edit().putBoolean(KEY_SUB_AUTO_APPLY, v).apply()
+
+    /** 最近一次联网时间（隐私审计页展示，不记录访问内容）。 */
+    var lastNetworkAt: Long
+        get() = sp.getLong(KEY_LAST_NETWORK, 0L)
+        set(v) = sp.edit().putLong(KEY_LAST_NETWORK, v).apply()
+
+    private fun defaultSources(): Set<String> =
+        (subscriptions + skipSubs).toHashSet()
+
+    private fun readMap(key: String): Map<String, String> {
+        val raw = sp.getString(key, "") ?: ""
+        if (raw.isBlank()) return emptyMap()
+        return runCatching {
+            val o = JSONObject(raw)
+            val m = LinkedHashMap<String, String>()
+            o.keys().forEach { k -> m[k] = o.optString(k, "") }
+            m
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun writeMap(key: String, v: Map<String, String>) {
+        val o = JSONObject()
+        v.forEach { (k, value) -> if (k.isNotBlank()) o.put(k, value) }
+        sp.edit().putString(key, o.toString()).apply()
+    }
 
     // ---------------- 今日统计（跨天自动归零） ----------------
 
@@ -241,10 +383,16 @@ class AppPrefs(ctx: Context) {
         private const val KEY_SUBS = "subs"
         private const val KEY_SUB_CACHE = "sub_cache"
         private const val KEY_SUB_MAP = "sub_map"
+        private const val KEY_SUB_AT = "sub_at"
         private const val KEY_SKIP_SUBS = "skip_subs"
         private const val KEY_SKIP_SUB_AT = "skip_sub_at"
         private const val KEY_SKIP_AUTO = "skip_auto_update"
         private const val KEY_CUSTOM_RULES = "custom_rules"
+        private const val KEY_APP_POLICIES = "app_skip_policies"
+        private const val KEY_APP_SKIP_OFF = "app_skip_off"
+        private const val KEY_PROTECTED_APPS = "app_protected"
+        private const val KEY_RECENT_APPS = "app_recent"
+        private const val RECENT_MAX = 8
         private const val DAY_MS = 24 * 60 * 60 * 1000L
         private const val KEY_MODE = "mode"
         private const val KEY_IP = "ip"
@@ -260,5 +408,15 @@ class AppPrefs(ctx: Context) {
         private const val KEY_STAT_DATE = "stat_date"
         private const val KEY_STAT_SKIP = "stat_skip"
         private const val KEY_STAT_SHAKE = "stat_shake"
+        private const val KEY_OBSERVE = "observe_mode"
+        private const val KEY_BOOT_RESTORE = "boot_restore"
+        private const val KEY_HEALTH_NOTIFY = "health_notify"
+        private const val KEY_SUB_WHITELIST = "sub_whitelist"
+        private const val KEY_SUB_GOOD = "sub_good_map"
+        private const val KEY_SUB_META = "sub_meta"
+        private const val KEY_SUB_ERROR = "sub_error"
+        private const val KEY_RULE_ERROR = "rule_load_error"
+        private const val KEY_SUB_AUTO_APPLY = "sub_auto_apply"
+        private const val KEY_LAST_NETWORK = "last_network_at"
     }
 }

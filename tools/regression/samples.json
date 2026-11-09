@@ -1,0 +1,222 @@
+{
+  "schema": 1,
+  "note": "典型节点树测试样本。单点用例验证评分/置信度/动作，整树用例验证误命中、重复点击、页面切换、跨应用影响。所有字段都是 NodeFacts 的构造参数，未写的走默认值。",
+  "cases": [
+    {
+      "id": "splash_sdk_skip",
+      "desc": "广告 SDK 跳过按钮：正确命中并允许自动点击",
+      "facts": { "text": "跳过 5s", "id": "com.bytedance.sdk:id/tt_splash_skip", "cls": "android.widget.TextView", "reason": "SDK_ID", "sdkId": true, "explicitText": true },
+      "expectAction": "CLICK", "expectLevel": "HIGH"
+    },
+    {
+      "id": "splash_explicit_text",
+      "desc": "明确文案「跳过广告」：正确命中",
+      "facts": { "text": "跳过广告", "reason": "EXPLICIT_TEXT", "explicitText": true },
+      "expectAction": "CLICK", "expectLevel": "HIGH"
+    },
+    {
+      "id": "countdown_end_zero",
+      "desc": "倒计时结束后出现「跳过 0s」，窗口已过 9 秒仍能点",
+      "facts": { "text": "跳过 0s", "windowAgeMs": 10500, "reason": "EXPLICIT_TEXT", "explicitText": true },
+      "expectAction": "CLICK", "expectLevel": "HIGH"
+    },
+    {
+      "id": "countdown_end_arrow",
+      "desc": "倒计时结束后出现「跳过 >」，11 秒仍能点",
+      "facts": { "text": "跳过 >", "windowAgeMs": 11000, "reason": "EXPLICIT_TEXT", "explicitText": true },
+      "expectAction": "CLICK", "expectLevel": "HIGH"
+    },
+    {
+      "id": "subscription_only",
+      "desc": "只有订阅规则、没有硬信号：中置信度，只记录不点击",
+      "facts": { "text": "跳过", "reason": "SUBSCRIPTION", "scopedRule": true },
+      "expectAction": "WAIT", "expectLevel": "MID"
+    },
+    {
+      "id": "subscription_plus_text",
+      "desc": "订阅规则 + 明确文案，多条件叠加到高置信度",
+      "facts": { "text": "跳过广告", "reason": "SUBSCRIPTION", "scopedRule": true, "explicitText": true },
+      "expectAction": "CLICK", "expectLevel": "HIGH"
+    },
+    {
+      "id": "mid_second_evidence",
+      "desc": "中置信度目标短时间内二次出现且证据变强：升级一次",
+      "facts": { "text": "跳过", "reason": "SUBSCRIPTION", "scopedRule": true, "evidenceRepeat": true },
+      "expectAction": "CLICK", "expectLevel": "HIGH"
+    },
+    {
+      "id": "normal_skip_chapter",
+      "desc": "正常业务按钮「跳过本章」不得误命中",
+      "facts": { "text": "跳过本章", "safeTarget": false },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "normal_close_notice",
+      "desc": "正常业务按钮「关闭通知」不得误命中",
+      "facts": { "text": "关闭通知", "safeTarget": false },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "feed_card",
+      "desc": "信息流广告卡片不点",
+      "facts": { "text": "广告", "left": 40, "top": 400, "right": 1040, "bottom": 520, "kind": "FEED" },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "rewarded_video",
+      "desc": "激励视频不点，关闭会让用户丢奖励",
+      "facts": { "text": "看视频领奖励", "kind": "REWARDED" },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "paid_cta",
+      "desc": "付费/下载广告 CTA 不点，点下去是打开广告",
+      "facts": { "text": "立即下载", "kind": "PAID" },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "unknown_kind",
+      "desc": "无法确认类型的目标不点",
+      "facts": { "text": "跳过", "kind": "UNKNOWN" },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "bank_disabled",
+      "desc": "银行类应用策略 DISABLED，同样的按钮也不能点",
+      "facts": { "pkg": "com.icbc", "text": "跳过 5s", "id": "com.bytedance.sdk:id/tt_splash_skip", "mode": "DISABLED", "sdkId": true, "explicitText": true },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "shop_popup_blocked",
+      "desc": "淘宝档位 SPLASH_ONLY：购物弹窗不处理",
+      "facts": { "pkg": "com.taobao.taobao", "text": "关闭推广", "kind": "POPUP", "popupRound": true, "inSplash": false, "mode": "SPLASH_ONLY", "explicitText": true, "sdkClose": true },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "news_popup_allowed",
+      "desc": "新闻类 FULL 档：带硬信号的推广弹窗可以关",
+      "facts": { "pkg": "com.tencent.news", "text": "关闭广告", "kind": "POPUP", "popupRound": true, "inSplash": false, "reason": "EXPLICIT_TEXT", "explicitText": true, "sdkClose": true, "corner": true },
+      "expectAction": "CLICK", "expectLevel": "HIGH"
+    },
+    {
+      "id": "observe_mode",
+      "desc": "安全观察模式：高置信度也只识别、不点击",
+      "facts": { "text": "跳过广告", "observe": true, "explicitText": true },
+      "expectAction": "OBSERVE", "expectLevel": "HIGH"
+    },
+    {
+      "id": "cooldown_same_window",
+      "desc": "点击成功后 2 秒冷却：同窗口不重复点击",
+      "facts": { "text": "跳过广告", "freshWindow": false, "cooldownActive": true, "explicitText": true },
+      "expectAction": "SKIP", "expectLevel": "HIGH"
+    },
+    {
+      "id": "window_changed_resets",
+      "desc": "窗口变化后冷却重置，可以重新判断",
+      "facts": { "text": "跳过广告", "freshWindow": true, "cooldownActive": true, "explicitText": true },
+      "expectAction": "CLICK", "expectLevel": "HIGH"
+    },
+    {
+      "id": "after_page_switch",
+      "desc": "页面切换后已超出开屏窗口，不继续操作",
+      "facts": { "text": "跳过广告", "windowAgeMs": 15000, "inSplash": false, "explicitText": true },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "coordinate_only",
+      "desc": "只有坐标兜底规则：低置信度，不操作",
+      "facts": { "text": "", "reason": "COORDINATE", "coordinateRule": true },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "wide_card",
+      "desc": "整行宽的卡片写着「跳过」：不是广告按钮",
+      "facts": { "text": "跳过", "left": 40, "top": 300, "right": 1040, "bottom": 380, "explicitText": true },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "long_text",
+      "desc": "长文案不当作跳过按钮",
+      "facts": { "text": "点击这里跳过广告并继续浏览内容", "scopedRule": true },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    },
+    {
+      "id": "user_interacting",
+      "desc": "用户正在操作时不抢点击",
+      "facts": { "text": "关闭广告", "kind": "POPUP", "popupRound": true, "inSplash": false, "userIdle": false, "explicitText": true, "sdkClose": true, "corner": true },
+      "expectAction": "SKIP", "expectLevel": "LOW"
+    }
+  ],
+  "trees": [
+    {
+      "id": "tree_splash_mixed",
+      "desc": "开屏整树：只有一个跳过按钮可点，正常按钮不被误命中",
+      "nodes": [
+        { "text": "跳过 4s", "id": "com.bytedance.sdk:id/tt_splash_skip", "reason": "SDK_ID", "sdkId": true, "explicitText": true },
+        { "text": "跳过本章", "safeTarget": false },
+        { "text": "立即下载", "kind": "PAID" },
+        { "text": "欢迎回来", "safeTarget": true }
+      ],
+      "expectClicks": 1,
+      "clickedTexts": ["跳过 4s"],
+      "forbidTexts": ["跳过本章", "立即下载", "欢迎回来"]
+    },
+    {
+      "id": "tree_feed_list",
+      "desc": "信息流列表：多个宽卡片关闭按钮，一个都不点",
+      "nodes": [
+        { "text": "广告", "left": 40, "top": 300, "right": 1040, "bottom": 500, "kind": "FEED" },
+        { "text": "赞助", "left": 40, "top": 600, "right": 1040, "bottom": 800, "kind": "FEED" },
+        { "text": "不感兴趣", "safeTarget": false }
+      ],
+      "expectClicks": 0,
+      "clickedTexts": [],
+      "forbidTexts": ["广告", "赞助", "不感兴趣"]
+    },
+    {
+      "id": "tree_bank",
+      "desc": "银行应用整树：策略禁用，任何节点都不点",
+      "nodes": [
+        { "text": "跳过 5s", "pkg": "com.icbc", "mode": "DISABLED", "sdkId": true, "explicitText": true },
+        { "text": "关闭广告", "pkg": "com.icbc", "mode": "DISABLED", "explicitText": true }
+      ],
+      "expectClicks": 0,
+      "clickedTexts": [],
+      "forbidTexts": ["跳过 5s", "关闭广告"]
+    },
+    {
+      "id": "tree_observe",
+      "desc": "观察模式整树：全部识别为 OBSERVE，零点击",
+      "nodes": [
+        { "text": "跳过广告", "observe": true, "explicitText": true },
+        { "text": "跳过本章", "observe": true, "safeTarget": false }
+      ],
+      "expectClicks": 0,
+      "expectAllObserve": true,
+      "clickedTexts": [],
+      "forbidTexts": []
+    },
+    {
+      "id": "tree_countdown_end",
+      "desc": "10.5 秒的整树：倒计时结束后只点「跳过 >」",
+      "nodes": [
+        { "text": "跳过 >", "windowAgeMs": 10500, "reason": "EXPLICIT_TEXT", "explicitText": true },
+        { "text": "了解详情", "windowAgeMs": 10500, "kind": "PAID" }
+      ],
+      "expectClicks": 1,
+      "clickedTexts": ["跳过 >"],
+      "forbidTexts": ["了解详情"]
+    },
+    {
+      "id": "tree_repeat_cooldown",
+      "desc": "同一目标在冷却期内重复出现：不产生重复点击",
+      "nodes": [
+        { "text": "跳过广告", "freshWindow": false, "cooldownActive": true, "explicitText": true },
+        { "text": "跳过广告", "freshWindow": false, "cooldownActive": true, "explicitText": true }
+      ],
+      "expectClicks": 0,
+      "clickedTexts": [],
+      "forbidTexts": ["跳过广告"]
+    }
+  ]
+}

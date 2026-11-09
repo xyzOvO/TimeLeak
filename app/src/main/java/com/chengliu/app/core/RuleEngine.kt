@@ -168,5 +168,24 @@ class RuleEngine {
 
     fun isBlocked(name: String): Boolean = decide(name) != null
 
+    /**
+     * 这个域名是不是被「放行规则」明确放过的。
+     * 运行概览里的「被放行的域名数量」只统计这类域名，不统计所有正常查询，
+     * 否则数字会等于 DNS 查询总数，毫无信息量。
+     */
+    fun isAllowed(name: String): Boolean {
+        val d = normalizeDomain(name) ?: return false
+        var cursor: String? = d
+        while (cursor != null) {
+            if (allowed.contains(cursor)) return true
+            val dot = cursor.indexOf('.')
+            if (dot < 0) break
+            val next = cursor.substring(dot + 1)
+            if (!next.contains('.')) break
+            cursor = next
+        }
+        return false
+    }
+
     fun count(): Int = builtin.size + custom.size + subscription.size
 }

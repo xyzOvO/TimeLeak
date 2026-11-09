@@ -1,12 +1,11 @@
 package com.chengliu.app.ui
 
 import android.content.Context
+import android.content.ContextWrapper
 import com.chengliu.app.BuildConfig
 import android.content.Intent
 import android.os.Build
-import android.accessibilityservice.AccessibilityServiceInfo
 import android.provider.Settings
-import android.view.accessibility.AccessibilityManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -19,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -33,6 +33,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -46,10 +47,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.LifecycleOwner
 import com.chengliu.app.core.AppPrefs
+import com.chengliu.app.core.PolicyMode
+import com.chengliu.app.core.SkipAdState
+import com.chengliu.app.core.SkipPolicyStore
 import com.chengliu.app.core.BlockLog
+import com.chengliu.app.core.SourceInfo
 import com.chengliu.app.core.CapturePlan
 import com.chengliu.app.core.DohEndpoints
 import com.chengliu.app.core.DohWatch
@@ -61,6 +70,7 @@ import com.chengliu.app.core.PrivateDns
 import com.chengliu.app.core.RuleParser
 import com.chengliu.app.core.SkipEngine
 import com.chengliu.app.core.SkipSources
+import com.chengliu.app.core.SubGuard
 import com.chengliu.app.core.VpnState
 import com.chengliu.app.core.normalizeDomain
 import com.chengliu.app.data.BuiltinRules
@@ -129,6 +139,8 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
     var refreshing by remember { mutableStateOf(false) }
 
     fun notifyService() {
+        // 服务可能没在跑：本地也刷一次来源，保证页面立刻显示刚改的这批规则
+        SourceInfo.refresh(ctx, prefs)
         LocalVpnService.send(ctx, LocalVpnService.ACTION_RELOAD)
     }
 
@@ -143,8 +155,15 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
             // 仍保留上次的规则，避免一次网络抖动把其它订阅一起冲掉。
             val map = prefs.subscriptionCacheMap.toMutableMap()
             var ok = 0
+            var skipped = 0
             withContext(Dispatchers.IO) {
                 for (u in subs) {
+                    // 公开订阅不无条件信任：未列入白名单的来源直接跳过，
+                    // 有阻断级异常（脚本片段、放行规则暴增、条数骤降）也不落盘。
+                    if (!SubGuard.isTrusted(prefs, u)) {
+                        skipped++
+                        continue
+                    }
                     var conn: HttpURLConnection? = null
                     try {
                         conn = URL(u).openConnection() as HttpURLConnection
@@ -156,8 +175,16 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
                         if (code in 200..299) {
                             val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
                             if (body.isNotBlank()) {
-                                map[u] = body
-                                ok++
+                                val check = SubGuard.inspect(prefs, u, body, map[u].orEmpty())
+                                if (check.blocked) {
+                                    prefs.subError = "$u：" + check.issues
+                                        .filter { it.blocking }.joinToString("；") { it.text }
+                                    skipped++
+                                } else {
+                                    map[u] = body
+                                    SubGuard.commit(ctx, u, body, check)
+                                    ok++
+                                }
                             }
                         }
                     } catch (_: Exception) {
@@ -166,11 +193,15 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
                     }
                 }
             }
+            prefs.lastNetworkAt = System.currentTimeMillis()
+            if (skipped == 0) prefs.subError = ""
             prefs.subscriptionCacheMap = map
             val merged = map.values.joinToString("\n")
             prefs.subscriptionCache = merged
+            if (ok > 0) prefs.subUpdatedAt = System.currentTimeMillis()
             subCount = RuleParser.parse(merged).size
-            message = "更新完成：$ok/${subs.size} 个来源，共 $subCount 条规则"
+            message = "更新完成：$ok/${subs.size} 个来源，共 $subCount 条规则" +
+                if (skipped > 0) "；$skipped 个来源未信任或有异常，已跳过（见「订阅安全」）" else ""
             notifyService()
             refreshing = false
         }
@@ -506,6 +537,13 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
             }, onCheckUpdate = onCheckUpdate)
 
             "skipad" -> SkipAdPage(ctx = ctx, prefs = prefs, scope = scope)
+            "apprules" -> AppRulesPage()
+
+            "overview" -> OverviewPage()
+            "health" -> HealthPage()
+            "observe" -> ObservePage()
+            "privacy" -> PrivacyPage()
+            "subguard" -> SubGuardPage()
         }
 
         Spacer(Modifier.height(40.dp))
@@ -567,19 +605,35 @@ private fun BlockLogPage(
                 }
             }
             Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(14.dp)) {
-                kindCounts.forEach { (kind, n) ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(6.dp).clip(CircleShape).background(kindTint(kind)))
-                        Spacer(Modifier.width(5.dp))
-                        Text("${kind.label} ${fmt(n)}", fontSize = 10.sp, color = ui.sub)
+            // 固定两列，不再把所有分类塞进一条 Row：类别一多，最后一项分到的
+            // 宽度会趋近于 0，Text 按极窄宽度换行成十几行，整张卡被撑出大块空白。
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                kindCounts.chunked(2).forEach { group ->
+                    Row(Modifier.fillMaxWidth()) {
+                        group.forEach { (kind, n) ->
+                            Row(
+                                Modifier.weight(1f),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Box(Modifier.size(6.dp).clip(CircleShape).background(kindTint(kind)))
+                                Spacer(Modifier.width(5.dp))
+                                // n 是该分类的拦截次数（sumOf count），不是服务数；写清「次」避免被读成个数
+                                Text(
+                                    "${kind.label} ${fmt(n)} 次",
+                                    fontSize = 10.sp,
+                                    color = ui.sub,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
                     }
                 }
             }
         } else {
             Spacer(Modifier.height(10.dp))
             Text(
-                if (enabled) "还没有新的拦截。明细只从本次运行开始算，左边是今天的总次数；有 App 想连广告或统计服务时，这里会写清它是谁、想干什么。"
+                if (enabled) "还没有新的拦截。明细只从本次运行开始算，左边是今天的总次数；有 App 想连广告或统计服务时，这里会写清它是谁、想干什么、以及是哪份名单把它拦下的。"
                 else "拦截明细已关闭，只统计总次数。需要看原因就重新打开下面那个开关。",
                 fontSize = 12.sp,
                 color = ui.sub,
@@ -632,7 +686,9 @@ private fun BlockLogPage(
         )
         ActionButton("清空这份记录", { BlockLog.clear() }, Modifier.fillMaxWidth(), onCard = true)
         Spacer(Modifier.height(8.dp))
-        Note("说明库覆盖 ${ServiceCatalog.size()} 个域名后缀，内容取自各公司公开资料；没收录的域名会直接显示它命中的那条规则，并标出规则来自内置、手动还是订阅。")
+        Note("归属说明共 ${ServiceCatalog.size() + ServiceCatalog.generatedSize()} 条：人工核实 ${ServiceCatalog.size()} 个域名后缀（依据见卡片的「资料依据」），另有 ${ServiceCatalog.generatedSize()} 条来自厂商域名族与 anti-AD 上游争议清单，随规则版本 ${ServiceCatalog.ruleSourceLabel()} 生成。查不到归属的只按名称与形态说明，明确标注「推断、未核实」，不编造公司名；识别全在本地，不联网、不上传查询过的域名。")
+        Spacer(Modifier.height(4.dp))
+        Note("当前生效的规则：${SourceInfo.summary()}。切换档位、开关内置规则或刷新订阅后，这里与之后新拦下的记录会立即同步；已有卡片保留命中当时的那份名单，不会改口说成一份当时没生效的来源。")
     }
 }
 
@@ -659,7 +715,7 @@ private fun ServiceCard(hit: com.chengliu.app.core.BlockHit) {
                 }
                 Spacer(Modifier.height(3.dp))
                 Text(
-                    "${hit.owner} · ${hit.kind.label} · ${hit.source.label}",
+                    "${hit.owner} · ${hit.kind.label}",
                     fontSize = 10.sp,
                     color = ui.sub,
                     maxLines = 1,
@@ -667,6 +723,12 @@ private fun ServiceCard(hit: com.chengliu.app.core.BlockHit) {
 
                 Spacer(Modifier.height(9.dp))
                 LabeledLine("它做什么", hit.what, ui.text.copy(alpha = 0.9f))
+                Spacer(Modifier.height(7.dp))
+                LabeledLine("命中时来自", hit.origin, ui.sub.copy(alpha = 0.9f))
+                if (hit.evidence.isNotEmpty()) {
+                    Spacer(Modifier.height(7.dp))
+                    LabeledLine("资料依据", hit.evidence, ui.sub.copy(alpha = 0.9f))
+                }
                 Spacer(Modifier.height(7.dp))
                 Row(Modifier.height(androidx.compose.foundation.layout.IntrinsicSize.Min)) {
                     Box(
@@ -684,7 +746,9 @@ private fun ServiceCard(hit: com.chengliu.app.core.BlockHit) {
                         lineHeight = 17.sp,
                     )
                 }
-                if (hit.domainText.isNotEmpty()) {
+                // 推断层卡片的标题本身就是域名，再列一遍只是重复；
+                // 只有归属明确的卡片才需要补一行「示例域名」
+                if (hit.evidence.isNotEmpty() && hit.domainText.isNotEmpty()) {
                     Spacer(Modifier.height(7.dp))
                     Text(hit.domainText, fontSize = 10.sp, color = ui.sub)
                 }
@@ -1291,9 +1355,9 @@ private fun AboutPage(onClear: () -> Unit, onCheckUpdate: () -> Unit) {
     Spacer(Modifier.height(12.dp))
     Card {
         SectionLabel("关于")
-        Note("Time Leak ${BuildConfig.VERSION_NAME} · 完全原创实现")
+        Note("Time Leak ${BuildConfig.VERSION_NAME}")
         Spacer(Modifier.height(8.dp))
-        Note("未使用任何第三方项目的代码、名称、图标或服务端；界面与交互为独立设计。")
+        Note("内置规则中的公开名单部分取自 anti-AD（GPL-3.0），只取域名清单，不含其代码，权利归原作者；订阅内容权利归各自作者。")
     }
     Spacer(Modifier.height(12.dp))
     Card {
@@ -1382,6 +1446,33 @@ private fun RuleRow(text: String, onRemove: () -> Unit) {
     }
 }
 
+/** 应用级策略的一行：左名字、右当前档位，点开切换。 */
+@Composable
+private fun PolicyEntryRow(name: String, mode: PolicyMode, custom: Boolean, onClick: () -> Unit) {
+    val ui = LocalUi.current
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable { onClick() }
+            .padding(vertical = 9.dp, horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(name, fontSize = 13.sp, color = ui.text)
+            if (custom) Text("自定义", fontSize = 10.sp, color = ui.accent)
+        }
+        Spacer(Modifier.width(8.dp))
+        Text(
+            mode.label,
+            fontSize = 12.sp,
+            color = if (mode == PolicyMode.DISABLED) ui.warn else ui.accent,
+        )
+        Spacer(Modifier.width(6.dp))
+        Text("›", fontSize = 14.sp, color = ui.sub)
+    }
+}
+
 /** 「上次更新」的人话描述。 */
 private fun subTimeLabel(at: Long): String {
     if (at <= 0L) return "尚未拉取过规则"
@@ -1394,15 +1485,110 @@ private fun subTimeLabel(at: Long): String {
     }
 }
 
-/** 检测本应用的无障碍服务是否已在系统设置里启用。 */
+/**
+ * 检测本应用的无障碍服务是否已在系统设置里启用（只代表系统记录，不代表服务真的在跑）。
+ *
+ * 直接读 Secure 表，不用 AccessibilityManager.getEnabledAccessibilityServiceList：
+ * 后者是客户端缓存，系统设置变化后不一定立刻更新，页面停留时状态会一直停在旧结论。
+ */
 private fun isAccessibilityEnabled(ctx: Context): Boolean {
-    val am = ctx.getSystemService(Context.ACCESSIBILITY_SERVICE) as? AccessibilityManager ?: return false
-    if (!am.isEnabled) return false
-    return am.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
-        .any {
-            it.resolveInfo.serviceInfo.packageName == ctx.packageName &&
-                it.resolveInfo.serviceInfo.name.endsWith("SkipAdService")
+    val r = ctx.contentResolver
+    if (Settings.Secure.getInt(r, Settings.Secure.ACCESSIBILITY_ENABLED, 0) != 1) return false
+    val flat = Settings.Secure.getString(r, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES).orEmpty()
+    // flatten 形如 com.chengliu.app/com.chengliu.app.core.SkipAdService 或 com.chengliu.app/.core.SkipAdService
+    return flat.split(':').any { part ->
+        val name = part.trim()
+        name.startsWith("${ctx.packageName}/") && name.endsWith("SkipAdService")
+    }
+}
+
+/** 跳过广告的真实状态：应用内开关、系统授权、服务连接三层分开看。 */
+internal enum class SkipAdStatus { OFF, NEED_PERMISSION, NOT_CONNECTED, RUNNING }
+
+internal data class SkipAdSnapshot(val status: SkipAdStatus, val lastEventAt: Long)
+
+private fun readSkipAdStatus(ctx: Context, enabled: Boolean): SkipAdSnapshot = SkipAdSnapshot(
+    status = when {
+        !enabled -> SkipAdStatus.OFF
+        !isAccessibilityEnabled(ctx) -> SkipAdStatus.NEED_PERMISSION
+        !SkipAdState.connected -> SkipAdStatus.NOT_CONNECTED
+        else -> SkipAdStatus.RUNNING
+    },
+    lastEventAt = SkipAdState.lastEventAt,
+)
+
+internal fun SkipAdStatus.shortLabel(): String = when (this) {
+    SkipAdStatus.OFF -> "未开启"
+    SkipAdStatus.NEED_PERMISSION -> "待授权"
+    SkipAdStatus.NOT_CONNECTED -> "未生效"
+    SkipAdStatus.RUNNING -> "已开启"
+}
+
+internal fun SkipAdStatus.title(): String = when (this) {
+    SkipAdStatus.OFF -> "跳过广告未开启"
+    SkipAdStatus.NEED_PERMISSION -> "未开启 · 需要授权"
+    SkipAdStatus.NOT_CONNECTED -> "已授权，但服务没连上"
+    SkipAdStatus.RUNNING -> "已开启 · 正在工作"
+}
+
+private fun eventTimeLabel(at: Long): String {
+    val sec = (System.currentTimeMillis() - at) / 1000L
+    return when {
+        sec < 10 -> "刚刚"
+        sec < 60 -> "$sec 秒前"
+        sec < 3600 -> "${sec / 60} 分钟前"
+        else -> "${sec / 3600} 小时前"
+    }
+}
+
+/** LocalContext 可能被包了一层，逐层解包找到 Activity 的 Lifecycle。 */
+private fun Context.lifecycleOrNull(): Lifecycle? {
+    var c: Context? = this
+    while (c != null) {
+        if (c is LifecycleOwner) return c.lifecycle
+        c = (c as? ContextWrapper)?.baseContext
+    }
+    return null
+}
+
+private fun openAccessibilitySettings(ctx: Context): Boolean = runCatching {
+    ctx.startActivity(
+        Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+    )
+}.isSuccess
+
+/**
+ * 每次回到页面（尤其是从系统设置授权后返回）都重读状态。
+ * 只依赖已有的 lifecycle-runtime，不引入新库；进程内静态量不落盘。
+ */
+@Composable
+internal fun rememberSkipAdStatus(enabled: Boolean): SkipAdSnapshot {
+    val ctx = LocalContext.current
+    val lifecycle = remember { ctx.lifecycleOrNull() }
+    val scope = rememberCoroutineScope()
+    var snap by remember { mutableStateOf(readSkipAdStatus(ctx, enabled)) }
+    fun refresh() { snap = readSkipAdStatus(ctx, enabled) }
+
+    DisposableEffect(lifecycle, enabled) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                refresh()
+                // 系统设置写入 Secure 表有短暂延迟，稍后再读一次，别停在旧结论上
+                scope.launch { delay(400L); refresh() }
+            }
         }
+        lifecycle?.addObserver(observer)
+        refresh()
+        onDispose { lifecycle?.removeObserver(observer) }
+    }
+    // 停留在本页时也定期核对：快捷设置 / 其它途径改授权不会触发 ON_RESUME
+    LaunchedEffect(enabled) {
+        while (true) {
+            delay(2000L)
+            refresh()
+        }
+    }
+    return snap
 }
 
 @Composable
@@ -1414,7 +1600,6 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     var subCount by remember { mutableStateOf(SkipEngine.groupCount()) }
     var refreshing by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf("") }
-    var accOn by remember { mutableStateOf(isAccessibilityEnabled(ctx)) }
     var showAdd by remember { mutableStateOf(false) }
     var input by remember { mutableStateOf("") }
     var shake by remember { mutableStateOf(prefs.shakeBlock) }
@@ -1426,6 +1611,48 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     var showSensorHelp by remember { mutableStateOf(false) }
     var skipCount by remember { mutableStateOf(prefs.skipToday) }
     var shakeCount by remember { mutableStateOf(prefs.shakeToday) }
+    // 安全观察模式：只识别不点击，是规则上线前的确认环节
+    var observe by remember { mutableStateOf(prefs.observeMode) }
+    // 唯一状态源：页面可见时自动刷新，避免授权回来后还显示旧结论
+    val skipStatus = rememberSkipAdStatus(enabled)
+
+    // 应用级跳过策略：只持久化用户改过的条目，预置表由 SkipPolicyStore 提供
+    var policies by remember { mutableStateOf(prefs.appPolicies) }
+    var editPolicyPkg by remember { mutableStateOf<String?>(null) }
+    var showAddPolicy by remember { mutableStateOf(false) }
+    var policyQuery by remember { mutableStateOf("") }
+    var showAllPresets by remember { mutableStateOf(false) }
+    var installedApps by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
+
+    LaunchedEffect(showAddPolicy) {
+        if (!showAddPolicy) return@LaunchedEffect
+        installedApps = withContext(Dispatchers.Default) {
+            val pm = ctx.packageManager
+            // Android 11+ 的 getInstalledApplications 受包可见性限制，只会返回
+            // 寥寥几个系统应用；查 LAUNCHER 入口能拿到用户真正装了的 App。
+            runCatching {
+                val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                pm.queryIntentActivities(intent, 0)
+                    .mapNotNull { ri ->
+                        val pkg = ri.activityInfo?.packageName ?: return@mapNotNull null
+                        if (pkg == ctx.packageName) return@mapNotNull null
+                        runCatching {
+                            pkg to pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+                        }.getOrNull()
+                    }
+                    .distinctBy { it.first }
+                    .sortedBy { it.second }
+            }.getOrDefault(emptyList())
+        }
+    }
+
+    fun savePolicy(pkg: String, mode: PolicyMode) {
+        val map = policies.toMutableMap()
+        map[pkg] = mode.name
+        policies = map
+        prefs.appPolicies = map
+        message = "已设置「${SkipPolicyStore.displayName(ctx, pkg)}」为「${mode.label}」"
+    }
 
     fun refresh(auto: Boolean = false) {
         if (refreshing) return
@@ -1442,6 +1669,11 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
             // 网络必须在 IO 线程：之前直接跑在主线程会抛 NetworkOnMainThreadException
             withContext(Dispatchers.IO) {
                 for (u in list) {
+                    // 和 DNS 订阅同一套安全网关：公开订阅不无条件信任。
+                    if (!SubGuard.isTrusted(prefs, u)) {
+                        android.util.Log.w("SkipAd", "订阅 $u 未在来源白名单中，已跳过")
+                        continue
+                    }
                     var conn: HttpURLConnection? = null
                     try {
                         conn = URL(u).openConnection() as HttpURLConnection
@@ -1454,8 +1686,16 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                         if (code in 200..299) {
                             val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText() }
                             if (body.isNotBlank()) {
-                                bodies[u] = body
-                                ok++
+                                val check = SubGuard.inspect(prefs, u, body, bodies[u].orEmpty())
+                                if (check.blocked) {
+                                    prefs.subError = "$u：" + check.issues
+                                        .filter { it.blocking }.joinToString("；") { it.text }
+                                    android.util.Log.w("SkipAd", "订阅 $u 存在阻断级异常，未应用")
+                                } else {
+                                    bodies[u] = body
+                                    SubGuard.commit(ctx, u, body, check)
+                                    ok++
+                                }
                             }
                             android.util.Log.i("SkipAd", "订阅 $u -> HTTP $code, ${body.length} 字符")
                         } else {
@@ -1466,6 +1706,7 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                     } finally { conn?.disconnect() }
                 }
             }
+            prefs.lastNetworkAt = System.currentTimeMillis()
             refreshing = false
             if (bodies.isEmpty()) {
                 if (!auto) message = "更新失败：连不上订阅源，换个网络再试"
@@ -1544,6 +1785,137 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
             },
             dismissButton = {
                 TextButton(onClick = { showAdd = false }) { Text("取消", color = ui.sub) }
+            },
+        )
+    }
+
+    editPolicyPkg?.let { pkg ->
+        val preset = SkipPolicyStore.PRESETS.firstOrNull { it.pkg == pkg }
+        // 走真实判定链：用户覆盖 > 预置表 > 包名/应用名类别推断 > 默认档
+        val current = SkipPolicyStore.forPkg(ctx, pkg).mode
+        AlertDialog(
+            onDismissRequest = { editPolicyPkg = null },
+            containerColor = ui.card,
+            titleContentColor = ui.text,
+            textContentColor = ui.text,
+            title = {
+                Text(
+                    "${SkipPolicyStore.displayName(ctx, pkg)} · 跳过策略",
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Medium,
+                )
+            },
+            text = {
+                Column {
+                    Note(pkg)
+                    if (preset != null) {
+                        Spacer(Modifier.height(4.dp))
+                        Note(preset.note)
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    PolicyMode.values().forEach { m ->
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable {
+                                    savePolicy(pkg, m)
+                                    editPolicyPkg = null
+                                }
+                                .padding(vertical = 8.dp, horizontal = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            RadioButton(selected = current == m, onClick = null)
+                            Spacer(Modifier.width(8.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(m.label, fontSize = 13.sp, color = ui.text)
+                                Note(m.desc)
+                            }
+                        }
+                    }
+                    if (policies.containsKey(pkg)) {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "恢复默认",
+                            fontSize = 12.sp,
+                            color = ui.warn,
+                            modifier = Modifier.clickable {
+                                val map = policies.toMutableMap()
+                                map.remove(pkg)
+                                policies = map
+                                prefs.appPolicies = map
+                                editPolicyPkg = null
+                                message = "已恢复「${SkipPolicyStore.displayName(ctx, pkg)}」的默认策略"
+                            },
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { editPolicyPkg = null }) { Text("关闭", color = ui.accent) }
+            },
+        )
+    }
+
+    if (showAddPolicy) {
+        val q = policyQuery.trim().lowercase()
+        val candidates = if (q.isEmpty()) {
+            installedApps.take(40)
+        } else {
+            installedApps.filter {
+                it.first.lowercase().contains(q) || it.second.lowercase().contains(q)
+            }.take(40)
+        }
+        AlertDialog(
+            onDismissRequest = { showAddPolicy = false },
+            containerColor = ui.card,
+            titleContentColor = ui.text,
+            textContentColor = ui.text,
+            title = { Text("添加应用策略", fontSize = 16.sp, fontWeight = FontWeight.Medium) },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = policyQuery,
+                        onValueChange = { policyQuery = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("搜索应用名，或直接填包名") },
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
+                        candidates.forEach { (p, label) ->
+                            Column(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        showAddPolicy = false
+                                        editPolicyPkg = p
+                                    }
+                                    .padding(vertical = 8.dp),
+                            ) {
+                                Text(label, fontSize = 13.sp, color = ui.text)
+                                Text(p, fontSize = 10.sp, color = ui.sub)
+                            }
+                        }
+                        if (candidates.isEmpty()) Note("没找到匹配的应用，也可以直接输入完整包名添加。")
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    Note("列表来自本机已安装应用；找不到时可以直接填完整包名。")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val p = policyQuery.trim()
+                    if (p.contains('.') && p.length > 3) {
+                        showAddPolicy = false
+                        editPolicyPkg = p
+                    } else {
+                        message = "请输入完整包名，例如 com.example.app"
+                    }
+                }) { Text("按包名添加", color = ui.accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddPolicy = false }) { Text("取消", color = ui.sub) }
             },
         )
     }
@@ -1627,6 +1999,92 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
         Spacer(Modifier.height(12.dp))
     }
 
+    // 开启状态卡：把「开关开了没」「系统授权了没」「服务真的连上了没」讲清楚
+    Card {
+        val tint = when (skipStatus.status) {
+            SkipAdStatus.RUNNING -> ui.active
+            SkipAdStatus.OFF -> ui.sub
+            else -> ui.warn
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(8.dp).clip(CircleShape).background(tint))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                skipStatus.status.title(),
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = tint,
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        when (skipStatus.status) {
+            SkipAdStatus.OFF ->
+                Note("上方开关还没打开。打开后还需要在系统设置里授权无障碍服务，跳过才会工作。")
+            SkipAdStatus.NEED_PERMISSION ->
+                Note("系统设置里没有开启「Time Leak 跳过广告」。点下面按钮，在「已安装的服务」里找到它并打开。")
+            SkipAdStatus.NOT_CONNECTED ->
+                Note("系统显示已授权，但本应用的无障碍服务没有真正连上。小米 / 澎湃常见于省电策略把服务冻住：去系统设置把这个开关关掉再开一次，并把省电策略设为「无限制」。")
+            SkipAdStatus.RUNNING -> {
+                Note("无障碍服务已连上，开屏广告与摇一摇跳转都在本机处理，不上传任何界面内容。")
+                Spacer(Modifier.height(4.dp))
+                Note(
+                    if (skipStatus.lastEventAt <= 0L) {
+                        "刚连上，还没收到界面事件。"
+                    } else {
+                        "最近一次收到界面事件：${eventTimeLabel(skipStatus.lastEventAt)}。息屏或手机闲置时不会刷新，属正常。"
+                    },
+                )
+            }
+        }
+        if (skipStatus.status != SkipAdStatus.RUNNING) {
+            Spacer(Modifier.height(12.dp))
+            ActionButton(
+                if (skipStatus.status == SkipAdStatus.NOT_CONNECTED) {
+                    "去系统设置重新开启"
+                } else {
+                    "去系统设置开启"
+                },
+                {
+                    message = if (openAccessibilitySettings(ctx)) {
+                        "请在「已安装的服务」里找到 Time Leak 跳过广告并开启"
+                    } else {
+                        "无法打开无障碍设置，请手动前往系统设置"
+                    }
+                },
+                Modifier.fillMaxWidth(),
+                onCard = true,
+            )
+            Spacer(Modifier.height(6.dp))
+            Note("授权后回到这一页，状态会自动更新。")
+        }
+    }
+    Spacer(Modifier.height(12.dp))
+
+    // 安全观察模式放在状态卡正下方：这是规则上线前最该先看到的东西。
+    Card {
+        SectionLabel("安全观察模式（核心功能）")
+        ToggleLine(
+            "只识别规则，不执行点击",
+            "开启后完整识别跳过按钮、关闭按钮与广告类型，逐条记录文本 / ID / 规则 / 置信度，但不会点任何控件、不会按返回键",
+            observe,
+        ) {
+            observe = it
+            prefs.observeMode = it
+        }
+        Spacer(Modifier.height(6.dp))
+        Note(
+            if (observe) {
+                "当前：观察模式，未点击。确认侧栏「安全观察」里的命中详情没问题后，关掉本开关即切回自动执行。"
+            } else {
+                "当前：自动执行。建议先开观察模式跑几个应用，确认没有误命中正常按钮再保持自动执行。"
+            },
+            if (observe) ui.warn else ui.sub,
+        )
+        Spacer(Modifier.height(6.dp))
+        Note("识别记录只存内存，退出即清空；不落盘、不进备份、不上传。")
+    }
+    Spacer(Modifier.height(12.dp))
+
     Card {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             SectionLabel("今日")
@@ -1660,21 +2118,17 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     Card {
         ToggleLine(
             title = "自动跳过开屏广告",
-            note = if (accOn) "无障碍服务已授权，正在后台拦截" else "需在系统设置里授权无障碍服务",
+            note = "功能总开关；是否真正生效，以上方状态卡为准",
             checked = enabled,
             onChange = { want ->
                 enabled = want
                 prefs.skipAdEnabled = want
-                accOn = isAccessibilityEnabled(ctx)
-                if (want && !accOn) {
-                    try {
-                        ctx.startActivity(
-                            Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                        )
-                        message = "请在「已安装的服务」里找到 Time Leak 跳过广告并开启"
-                    } catch (_: Exception) {
-                        message = "无法打开无障碍设置，请手动前往系统设置"
+                // 已授权但服务没连上（假绑定）也要引导去设置重开，不能只看系统开关
+                if (want && readSkipAdStatus(ctx, want).status != SkipAdStatus.RUNNING) {
+                    message = if (openAccessibilitySettings(ctx)) {
+                        "请在「已安装的服务」里找到 Time Leak 跳过广告并开启"
+                    } else {
+                        "无法打开无障碍设置，请手动前往系统设置"
                     }
                 }
             },
@@ -1786,8 +2240,61 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     }
     Spacer(Modifier.height(12.dp))
     Card {
+        SectionLabel("应用级跳过策略")
+        Note("按应用决定要不要自动点。点条目可改档位；没列出的应用会按包名和应用名自动归类。")
+        Spacer(Modifier.height(8.dp))
+
+        val presetList = if (showAllPresets) {
+            SkipPolicyStore.PRESETS
+        } else {
+            SkipPolicyStore.PRESETS.take(4)
+        }
+        presetList.forEach { p ->
+            PolicyEntryRow(
+                name = p.label,
+                // 走真实判定：保护名单 / 临时关闭 / 用户覆盖都会反映在这里
+                mode = SkipPolicyStore.forPkg(ctx, p.pkg).mode,
+                custom = policies.containsKey(p.pkg),
+                onClick = { editPolicyPkg = p.pkg },
+            )
+        }
+        policies.keys
+            .filterNot { k -> SkipPolicyStore.PRESETS.any { it.pkg == k } }
+            .sorted()
+            .forEach { pkg ->
+                PolicyEntryRow(
+                    name = SkipPolicyStore.displayName(ctx, pkg),
+                    mode = SkipPolicyStore.forPkg(ctx, pkg).mode,
+                    custom = true,
+                    onClick = { editPolicyPkg = pkg },
+                )
+            }
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            ActionButton(
+                if (showAllPresets) "收起" else "全部 ${SkipPolicyStore.PRESETS.size} 项",
+                { showAllPresets = !showAllPresets },
+                Modifier.weight(1f),
+                onCard = true,
+            )
+            ActionButton(
+                "＋ 添加应用",
+                { policyQuery = ""; showAddPolicy = true },
+                Modifier.weight(1f),
+                onCard = true,
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Note("自动归类：银行 / 支付 / 政务 → 不自动点击；电商 → 只跳过开屏；短视频 → 仅明确开屏按钮；其余 → 开屏 + 推广弹窗。")
+        Spacer(Modifier.height(6.dp))
+        Note("逐应用的开关、保护名单、最近使用与导入导出在侧栏「应用规则」页；这里保留常用预置的快捷入口。")
+    }
+    Spacer(Modifier.height(12.dp))
+    Card {
         Note("本能力通过 Android 无障碍服务实现，需要你授予「无障碍」权限。所有匹配都在你的手机上完成，不上传任何界面内容；今日计数只存在本机，不记录具体跳过什么。")
         Spacer(Modifier.height(6.dp))
         Note("小米 / 澎湃机型建议把 Time Leak 的省电策略设为「无限制」并允许自启动，否则后台被清理后无障碍服务会被系统挂起，跳过时好时坏。")
+        Spacer(Modifier.height(6.dp))
+        Note("只自动点击开屏广告和带明确广告信号的推广弹窗。信息流广告、激励视频、付费 / 下载广告以及认不出来的目标一律不点；宁可漏点，不可误点。")
     }
 }
