@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Time Leak</string>
+    <string name="vpn_label">Time Leak · 本地过滤</string>
+    <string name="notif_title">Time Leak 正在过滤</string>
+    <string name="notif_text">仅处理本机 DNS 查询，不记录域名</string>
+    <string name="skip_ad_service_desc">自动点击开屏广告与弹窗里的「跳过」「关闭」等按钮，并在摇一摇广告跳出到浏览器、应用商店或电商页面时自动退回原应用。本服务不收集、不上传任何数据。</string>
+</resources>

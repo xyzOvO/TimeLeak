@@ -1,0 +1,24 @@
+# Built artifacts (release APK is kept at repo root as the publishable artifact)
+app/build/
+build/
+.gradle/
+captures/
+*.apk
+!app-release.apk
+
+# Local build config (may contain machine-specific paths)
+local.properties
+*.iml
+.idea/
+.DS_Store
+
+# Unsigned / old internal builds, logs, screenshots that may contain private data
+澄流-*.apk
+*.log
+docs/
+preview/
+
+# Keystore / signing (never commit)
+*.jks
+*.keystore
+signing.properties
