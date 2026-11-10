@@ -82,7 +82,8 @@ object RunStats {
         if (sp != null) return
         sp = ctx.applicationContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
         loadFromSp()
-        flusher.scheduleAtFixedRate({ flush() }, 5, 5, TimeUnit.SECONDS)
+        // 同上：固定延迟，避免进程被缓存后“补跑”大量落盘任务。
+        flusher.scheduleWithFixedDelay({ flush() }, 5, 5, TimeUnit.SECONDS)
     }
 
     private fun today(): String = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())

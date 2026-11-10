@@ -26,6 +26,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -63,7 +66,8 @@ fun HomeScreen(
                 modifier = Modifier
                     .size(38.dp)
                     .clip(RoundedCornerShape(11.dp))
-                    .clickable { onOpenMenu() },
+                    .clickable(role = Role.Button, onClickLabel = "打开菜单") { onOpenMenu() }
+                    .semantics { contentDescription = "打开菜单" },
                 contentAlignment = Alignment.Center,
             ) {
                 GlyphIcon(Glyph.MENU, ui.text, Modifier.size(21.dp))
@@ -150,7 +154,11 @@ fun HomeScreen(
                     .size(84.dp)
                     .clip(RoundedCornerShape(26.dp))
                     .background(if (running) ui.warn else ui.accent)
-                    .clickable { onToggle() },
+                    .clickable(
+                        role = Role.Button,
+                        onClickLabel = if (running) "停止过滤" else "开启过滤",
+                    ) { onToggle() }
+                    .semantics { contentDescription = if (running) "停止过滤" else "开启过滤" },
                 contentAlignment = Alignment.Center,
             ) {
                 GlyphIcon(
@@ -348,7 +356,7 @@ private fun RecentRow(hit: BlockHit, onClick: () -> Unit) {
             Text(
                 "为什么拦：" + hit.why,
                 fontSize = 10.sp,
-                color = ui.sub.copy(alpha = 0.8f),
+                color = ui.sub,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )

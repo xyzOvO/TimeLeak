@@ -64,7 +64,7 @@ object PrivateDns {
     }
 
     /** 严格模式下，这些地址必须从接管列表里排除的原因说明；不需要排除时返回 null。 */
-    fun exclusionNote(state: State, excluded: List<String>): String? {
+    fun exclusionNote(excluded: List<String>): String? {
         if (excluded.isEmpty()) return null
         val addr = excluded.joinToString(" / ")
         return "它的地址（$addr）原本在接管列表里，为避免把 DoT 一起丢弃导致整机解析失败，" +

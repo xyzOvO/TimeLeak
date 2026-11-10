@@ -181,7 +181,8 @@ class CaptureRoutes private constructor(
         }
 
         /** 回环、链路本地、ULA、组播、IPv4 映射段都不该出现在接管列表里。 */
-        private fun isPrivate6(b: ByteArray): Boolean {            val b0 = b[0].toInt() and 0xFF
+        private fun isPrivate6(b: ByteArray): Boolean {
+            val b0 = b[0].toInt() and 0xFF
             val b1 = b[1].toInt() and 0xFF
             val allZero = b.all { it.toInt() == 0 }
             if (allZero) return true

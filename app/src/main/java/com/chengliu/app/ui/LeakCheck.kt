@@ -170,7 +170,7 @@ object LeakCheck {
         }
 
         // 5. 系统私人 DNS：只读状态 + 说明「已经为它让路了哪几个地址」
-        val note = PrivateDns.exclusionNote(privateDns, dropped)
+        val note = PrivateDns.exclusionNote(dropped)
         out.add(
             when (privateDns.mode) {
                 PrivateDns.Mode.OFF -> Result("私人 DNS", PASS, PrivateDns.summary(privateDns))

@@ -26,6 +26,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -66,7 +67,7 @@ fun AppRulesPage() {
     var apps by remember { mutableStateOf(emptyList<AppEntry>()) }
     var loading by remember { mutableStateOf(true) }
     var query by remember { mutableStateOf("") }
-    var limit by remember { mutableStateOf(12) }
+    var limit by remember { mutableIntStateOf(12) }
     var policies by remember { mutableStateOf(prefs.appPolicies) }
     var skipOff by remember { mutableStateOf(prefs.appSkipOff) }
     var protected by remember { mutableStateOf(prefs.protectedApps) }

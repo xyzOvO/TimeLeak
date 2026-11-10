@@ -1,5 +1,6 @@
 package com.chengliu.app.ui
 
+import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
@@ -31,6 +32,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -142,6 +144,10 @@ internal fun ExSwitch(title: String, note: String, checked: Boolean, onChange: (
 private fun fmt(at: Long): String =
     if (at <= 0L) "无" else SimpleDateFormat("MM-dd HH:mm:ss", Locale.US).format(Date(at))
 
+/** RunStats 的日期键是 yyyyMMdd（便于比较与落盘），直接显示会变成一串数字，这里补上分隔符。 */
+private fun fmtDay(key: String): String =
+    if (key.length == 8) "${key.substring(0, 4)}-${key.substring(4, 6)}-${key.substring(6)}" else key
+
 // ---------------- 运行概览：8 项指标 ----------------
 
 @Composable
@@ -150,6 +156,7 @@ fun OverviewPage() {
     val ctx = LocalContext.current
     val stats by RunStats.state.collectAsState()
     val counts by Counters.today.collectAsState()
+    val throttled by Counters.throttled.collectAsState()
     val running by VpnState.running.collectAsState()
     val a11y = HealthChecker.accessibilityEnabled(ctx)
     val prefs = remember { AppPrefs(ctx) }
@@ -186,11 +193,13 @@ fun OverviewPage() {
             "今日拦截广告数量" to counts.second.toString(),
             "今日 DNS 查询数量" to counts.first.toString(),
             "开屏广告跳过次数" to stats.skipClicks.toString(),
-            "DNS 拦截次数" to counts.second.toString(),
+            // 原来这里是「DNS 拦截次数」，读的就是 counts.second，和上面第一项完全重复；
+            // v1.3.5 起用熔断次数顶上，才是真正独立的指标。
+            "查询风暴熔断次数" to throttled.toString(),
             "被放行的域名数量" to if (stats.allowedCapped) "≥${stats.allowedDomains}" else stats.allowedDomains.toString(),
             "今日观察记录" to stats.observed.toString(),
             "绕过接管次数" to stats.bypass.toString(),
-            "统计日期" to stats.date,
+            "统计日期" to fmtDay(stats.date),
         )
         // 固定两列 + 单行省略：之前单条 Row 在类别多时把最后一项挤成极窄宽度，
         // 不可见的多行把卡片撑出一大块空白，这里从布局上根治。
@@ -257,6 +266,8 @@ fun OverviewPage() {
 
 // ---------------- 运行状态自检 ----------------
 
+// 只提供「关闭电池优化」系统入口，不做静默申请；本应用不上架 Play，这条策略检查不适用。
+@SuppressLint("BatteryLife")
 @Composable
 fun HealthPage() {
     val ui = LocalUi.current
@@ -267,7 +278,7 @@ fun HealthPage() {
     var items by remember { mutableStateOf(HealthChecker.check(ctx, null)) }
     var testing by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf("") }
-    var budgetTick by remember { mutableStateOf(0) }
+    var budgetTick by remember { mutableIntStateOf(0) }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -672,7 +683,7 @@ fun PrivacyPage() {
     val prefs = remember { AppPrefs(ctx) }
     var message by remember { mutableStateOf("") }
     var confirmAll by remember { mutableStateOf(false) }
-    var refreshTick by remember { mutableStateOf(0) }
+    var refreshTick by remember { mutableIntStateOf(0) }
 
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json"),
@@ -826,7 +837,7 @@ fun SubGuardPage() {
     var message by remember { mutableStateOf("") }
     var loading by remember { mutableStateOf(false) }
     var previews by remember { mutableStateOf<Map<String, Preview>>(emptyMap()) }
-    var tick by remember { mutableStateOf(0) }
+    var tick by remember { mutableIntStateOf(0) }
     var autoApply by remember { mutableStateOf(prefs.subAutoApply) }
 
     fun apply(url: String, p: Preview) {

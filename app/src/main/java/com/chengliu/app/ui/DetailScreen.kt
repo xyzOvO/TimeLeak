@@ -37,6 +37,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -46,6 +47,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -105,7 +109,7 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
     var mode by remember { mutableStateOf(prefs.upstreamMode) }
     var ip by remember { mutableStateOf(prefs.upstreamIp) }
     var doh by remember { mutableStateOf(prefs.dohUrl) }
-    var subCount by remember { mutableStateOf(RuleParser.parse(prefs.subscriptionCache).size) }
+    var subCount by remember { mutableIntStateOf(RuleParser.parse(prefs.subscriptionCache).size) }
 
     var leakGuard by remember { mutableStateOf(prefs.leakGuard) }
     var stripEcs by remember { mutableStateOf(prefs.stripEcs) }
@@ -114,11 +118,11 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
     var checking by remember { mutableStateOf(false) }
     var leakText by remember { mutableStateOf(prefs.leakTargetsText) }
     var leakNote by remember { mutableStateOf(prefs.leakTargetNote) }
-    var leakCount by remember { mutableStateOf(prefs.leakTargetIps.size) }
+    var leakCount by remember { mutableIntStateOf(prefs.leakTargetIps.size) }
     var leakDraft by remember { mutableStateOf(prefs.leakTargetsText) }
     var showLeak by remember { mutableStateOf(false) }
     var leakSaving by remember { mutableStateOf(false) }
-    var hitsVersion by remember { mutableStateOf(0) }
+    var hitsVersion by remember { mutableIntStateOf(0) }
     val dohHits = remember(hitsVersion) { DohWatch.snapshot() }
     // 私人 DNS 状态只读，不需要监听；进页面时取一次就够（改系统设置要用户自己动手）
     val privateDnsState = remember(section) { PrivateDns.read(ctx) }
@@ -133,7 +137,7 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
     val bypasses by Counters.bypass.collectAsState()
     val counts by Counters.today.collectAsState()
 
-    var dialogKind by remember { mutableStateOf(-1) }
+    var dialogKind by remember { mutableIntStateOf(-1) }
     var input by remember { mutableStateOf("") }
     var message by remember { mutableStateOf("") }
     var refreshing by remember { mutableStateOf(false) }
@@ -343,7 +347,8 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
                 modifier = Modifier
                     .size(38.dp)
                     .clip(RoundedCornerShape(11.dp))
-                    .clickable { onBack() },
+                    .clickable(role = Role.Button, onClickLabel = "返回") { onBack() }
+                    .semantics { contentDescription = "返回" },
                 contentAlignment = Alignment.Center,
             ) {
                 GlyphIcon(Glyph.BACK, ui.text, Modifier.size(21.dp))
@@ -1040,6 +1045,12 @@ private fun ShieldPage(
             value = if (running) "运行中" else "未开启，下面的改动要等启动后才生效",
             color = if (running) ui.active else ui.sub,
         )
+        // 系统严格私人 DNS 的地址被从接管列表排除时必须说明，
+        // 否则用户会疑惑「为什么少了几条路由」。隐私审计页也显示同一条说明。
+        PrivateDns.exclusionNote(privateDnsDropped)?.let {
+            Spacer(Modifier.height(8.dp))
+            Note(it)
+        }
     }
 
     Spacer(Modifier.height(12.dp))
@@ -1597,7 +1608,7 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     var enabled by remember { mutableStateOf(prefs.skipAdEnabled) }
     var builtin by remember { mutableStateOf(prefs.skipBuiltin) }
     var subs by remember { mutableStateOf(prefs.skipSubs.sorted()) }
-    var subCount by remember { mutableStateOf(SkipEngine.groupCount()) }
+    var subCount by remember { mutableIntStateOf(SkipEngine.groupCount()) }
     var refreshing by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf("") }
     var showAdd by remember { mutableStateOf(false) }
@@ -1605,12 +1616,12 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     var shake by remember { mutableStateOf(prefs.shakeBlock) }
     var showCustom by remember { mutableStateOf(false) }
     var customInput by remember { mutableStateOf(prefs.customRules) }
-    var customCount by remember { mutableStateOf(SkipEngine.keywordCount() + SkipEngine.popupCount()) }
+    var customCount by remember { mutableIntStateOf(SkipEngine.keywordCount() + SkipEngine.popupCount()) }
     var autoUpdate by remember { mutableStateOf(prefs.skipAutoUpdate) }
     var updatedLabel by remember { mutableStateOf(subTimeLabel(prefs.skipSubAt)) }
     var showSensorHelp by remember { mutableStateOf(false) }
-    var skipCount by remember { mutableStateOf(prefs.skipToday) }
-    var shakeCount by remember { mutableStateOf(prefs.shakeToday) }
+    var skipCount by remember { mutableIntStateOf(prefs.skipToday) }
+    var shakeCount by remember { mutableIntStateOf(prefs.shakeToday) }
     // 安全观察模式：只识别不点击，是规则上线前的确认环节
     var observe by remember { mutableStateOf(prefs.observeMode) }
     // 唯一状态源：页面可见时自动刷新，避免授权回来后还显示旧结论

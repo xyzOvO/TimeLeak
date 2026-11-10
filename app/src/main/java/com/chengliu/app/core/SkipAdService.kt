@@ -223,6 +223,9 @@ class SkipAdService : AccessibilityService() {
                 handler.removeCallbacks(pendingScan)
                 handler.postDelayed(pendingScan, SCAN_MERGE_MS)
             }
+
+            // 其它事件在函数开头已被 return 掉；这里显式收尾，避免 lint 的 SwitchIntDef 告警。
+            else -> {}
         }
     }
 

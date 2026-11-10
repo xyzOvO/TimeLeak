@@ -58,7 +58,9 @@ object Counters {
         _today.value = qMem.get() to bMem.get()
         _bypass.value = rMem.get()
         _throttled.value = tMem.get()
-        flusher.scheduleAtFixedRate({ flushLocked() }, 5, 5, TimeUnit.SECONDS)
+        // 用 scheduleWithFixedDelay 而不是 scheduleAtFixedRate：进程从 cached 变回 uncached 时，
+        // 固定速率会把错过的周期一次性补跑成百上千次，反而制造耗电尖峰。
+        flusher.scheduleWithFixedDelay({ flushLocked() }, 5, 5, TimeUnit.SECONDS)
     }
 
     private fun read(): LongArray {
@@ -90,7 +92,7 @@ object Counters {
         if (day == memDay) return
         flushLocked()
         memDay = day
-        qMem.set(0); bMem.set(0); rMem.set(0)
+        qMem.set(0); bMem.set(0); rMem.set(0); tMem.set(0)
     }
 
     @Synchronized

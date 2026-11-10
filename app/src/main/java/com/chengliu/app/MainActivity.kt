@@ -62,6 +62,7 @@ import com.chengliu.app.core.SourceInfo
 import com.chengliu.app.core.UpdateChecker
 import kotlinx.coroutines.Job
 import java.io.File
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
@@ -188,7 +189,8 @@ private fun AppRoot(
                 updateUi = UpdateUi.Error("下载失败，请检查网络后重试")
                 return@launch
             }
-            runCatching { dest.setReadable(true, false) }
+            // 不再把 APK 设成全局可读：FileProvider + FLAG_GRANT_READ_URI_PERMISSION
+            // 已经把临时读权限授给了系统安装器，setReadable(true,false) 只会额外暴露文件。
             if (!UpdateChecker.signaturesMatch(context, dest.absolutePath)) {
                 updateUi = UpdateUi.SignatureMismatch
                 return@launch
@@ -378,5 +380,5 @@ private sealed interface UpdateUi {
 private fun formatMB(bytes: Long): String {
     if (bytes <= 0) return "0.0 MB"
     val mb = bytes / (1024.0 * 1024.0)
-    return if (mb < 1) "${bytes / 1024} KB" else String.format("%.1f MB", mb)
+    return if (mb < 1) "${bytes / 1024} KB" else String.format(Locale.ROOT, "%.1f MB", mb)
 }

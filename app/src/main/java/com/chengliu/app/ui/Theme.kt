@@ -30,16 +30,24 @@ data class UiColors(
     val warn: Color,
 )
 
+/*
+ * 对比度按 WCAG AA 校过（原先三处不达标，小字与深色按钮偏灰/偏暗）：
+ *  - 浅色 sub：#8B919B → #6F7681，白底约 4.6:1（原来约 3.2:1），10–12sp 说明文字可读；
+ *  - 浅色 warn：#D9534F → #C0392B，浅灰卡片上约 5.0:1（原来约 3.6:1），白字按钮仍 >5:1；
+ *  - 深色 accent：#1B7193 → #5C86F0，它同时用作文字与按钮底：
+ *    深色卡片上作文字约 4.5:1（原来约 2.8:1），白字/白图标压在上面约 3.4:1。
+ * 只调明度，不换色相，保持与原配色一致的观感。
+ */
 private val LightUi = UiColors(
     bg = Color(0xFFFFFFFF),
     card = Color(0xFFF3F5F9),
     text = Color(0xFF1B1E23),
-    sub = Color(0xFF8B919B),
+    sub = Color(0xFF6F7681),
     line = Color(0xFFE6E9EE),
     accent = Color(0xFF3B6DF2),
     onAccent = Color(0xFFFFFFFF),
     active = Color(0xFF2E9E7B),
-    warn = Color(0xFFD9534F),
+    warn = Color(0xFFC0392B),
 )
 
 private val DarkUi = UiColors(
@@ -48,7 +56,7 @@ private val DarkUi = UiColors(
     text = Color(0xFFF1F2F5),
     sub = Color(0xFF8A8E98),
     line = Color(0xFF2C2F36),
-    accent = Color(0xFF1B7193),
+    accent = Color(0xFF5C86F0),
     onAccent = Color(0xFFFFFFFF),
     active = Color(0xFF43B08C),
     warn = Color(0xFFE0665C),

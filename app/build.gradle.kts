@@ -13,8 +13,8 @@ android {
         // 保持 33：Android 14+ 对 targetSdk>=34 强制前台服务类型声明，
         // 本地工具类应用无需上架，避开这层兼容分支更稳、也更轻。
         targetSdk = 33
-        versionCode = 14
-        versionName = "1.3.5"
+        versionCode = 15
+        versionName = "1.3.6"
     }
 
     buildTypes {
@@ -44,6 +44,12 @@ android {
         kotlinCompilerExtensionVersion = "1.5.15"
     }
 
+    testOptions {
+        // 纯逻辑类（DNS/规则/JSON）在 JVM 单测里直接跑；
+        // android.util.Log 等桩方法返回默认值，避免 "not mocked" 抛错。
+        unitTests.isReturnDefaultValues = true
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -70,4 +76,40 @@ dependencies {
 
     // 网络请求一律用 Android 自带的 HttpURLConnection，
     // 不引第三方网络库，也不引任何统计、崩溃、推送 SDK。
+
+    // 只用于本机 JVM 单测，不进 APK。
+    testImplementation("junit:junit:4.13.2")
+}
+
+// —— JVM 单测运行支持 ——
+// 症状：7 个用例全部 initializationError → ClassNotFoundException。
+// 根因：Gradle 8.9 在 classpath 过长时把测试 JVM 的参数写成 @argfile（UTF-8 编码），
+//       而 java.exe 读 @argfile 用的是系统编码（中文 Windows 为 GBK），
+//       D:\AI库\... 被解成乱码，项目内的 class 目录在测试 JVM 里全部失效。
+//       同一份 classpath 直接以 -cp 传参则完全正常（已实测）。
+// 处理：把解析好的 classpath 落成文本文件，交给 run-tests.sh 用 -cp 直接跑。
+//       工程若迁到纯 ASCII 路径，标准入口 testDebugUnitTest 同样可用。
+tasks.register("writeUnitTestClasspath") {
+    group = "verification"
+    description = "导出 debug 单测完整 classpath，供 run-tests.sh 绕开 @argfile 编码问题"
+    dependsOn("compileDebugUnitTestKotlin", "compileDebugUnitTestJavaWithJavac")
+    val outFile = layout.buildDirectory.file("unitTestClasspath.txt")
+    doLast {
+        val javacRoot = layout.buildDirectory.dir("intermediates/javac/debugUnitTest").get().asFile
+        // AGP 8.7 把 javac 产物放在 intermediates/javac/<variant>/<taskName>/classes，
+        // 低版本是 intermediates/javac/<variant>/classes，这里按目录名找，避免绑死版本。
+        val javacStub = javacRoot.walkTopDown()
+            .firstOrNull { it.isDirectory && it.name == "classes" }
+            ?: javacRoot
+        val kotlinTest = layout.buildDirectory.dir("tmp/kotlin-classes/debugUnitTest").get().asFile
+        val kotlinMain = layout.buildDirectory.dir("tmp/kotlin-classes/debug").get().asFile
+        // 顺序有意义：android.util.Log 的测试桩必须排在 android.jar 之前。
+        val head = listOf(javacStub, kotlinTest, kotlinMain).filter { it.isDirectory }
+        val cp = files(head)
+            .plus(configurations.getByName("debugUnitTestRuntimeClasspath"))
+            .files
+            .joinToString(System.getProperty("path.separator"))
+        outFile.get().asFile.writeText(cp)
+        println("unitTestClasspath -> ${outFile.get().asFile.absolutePath}")
+    }
 }
