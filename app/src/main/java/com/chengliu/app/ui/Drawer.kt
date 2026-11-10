@@ -43,85 +43,72 @@ fun AppDrawerContent(
     val prefs = remember { AppPrefs(ctx) }
     // 侧栏也给一个状态标：不用进页面就能看出跳过广告到底开没开
     val skipStatus = rememberSkipAdStatus(prefs.skipAdEnabled)
+    // 整块一起滚动：项目来源块排在导航之后，不钉在底部（内容多时随列表滑走）
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .background(ui.bg),
+            .background(ui.bg)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 26.dp),
     ) {
-        // 可滚动的主体：品牌头 + 导航。weight(1f) 把页脚顶到底部。
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 26.dp),
-        ) {
-            Text("Time Leak", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = ui.text)
-            Spacer(Modifier.height(6.dp))
-            Text("本地过滤 · 不留记录", fontSize = 12.sp, color = ui.sub)
-            // 品牌短标记：用主色点一道，呼应主页启动按钮
-            Spacer(Modifier.height(12.dp))
-            Box(
-                Modifier
-                    .width(28.dp)
-                    .height(3.dp)
-                    .clip(RoundedCornerShape(2.dp))
-                    .background(ui.accent),
-            )
+        Text("Time Leak", fontSize = 22.sp, fontWeight = FontWeight.Bold, color = ui.text)
+        Spacer(Modifier.height(6.dp))
+        Text("本地过滤 · 不留记录", fontSize = 12.sp, color = ui.sub)
+        // 品牌短标记：用主色点一道，呼应主页启动按钮
+        Spacer(Modifier.height(12.dp))
+        Box(
+            Modifier
+                .width(28.dp)
+                .height(3.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(ui.accent),
+        )
 
-            Spacer(Modifier.height(24.dp))
-            // 按 key 分组，不再写死下标：以后加页面不会错位
-            val groups = listOf(
-                listOf("home", "overview", "blocklog", "rules"),
-                listOf("upstream", "shield", "health", "subs", "subguard"),
-                listOf("blocked", "allowed", "skipad", "apprules", "observe"),
-            )
-            groups.forEachIndexed { index, keys ->
-                if (index > 0) DrawerDivider()
-                for (key in keys) {
-                    val item = navItem(key)
-                    val badge = if (key == "skipad") skipStatus.status.shortLabel() else null
-                    val badgeColor = when (skipStatus.status) {
-                        SkipAdStatus.RUNNING -> ui.active
-                        SkipAdStatus.OFF -> ui.sub
-                        else -> ui.warn
-                    }
-                    DrawerRow(item, current == item.key, { onNavigate(item.key) }, badge, badgeColor)
+        Spacer(Modifier.height(24.dp))
+        // 按 key 分组，不再写死下标：以后加页面不会错位
+        val groups = listOf(
+            listOf("home", "overview", "blocklog", "rules"),
+            listOf("upstream", "shield", "health", "subs", "subguard"),
+            listOf("blocked", "allowed", "skipad", "apprules", "observe"),
+        )
+        groups.forEachIndexed { index, keys ->
+            if (index > 0) DrawerDivider()
+            for (key in keys) {
+                val item = navItem(key)
+                val badge = if (key == "skipad") skipStatus.status.shortLabel() else null
+                val badgeColor = when (skipStatus.status) {
+                    SkipAdStatus.RUNNING -> ui.active
+                    SkipAdStatus.OFF -> ui.sub
+                    else -> ui.warn
                 }
+                DrawerRow(item, current == item.key, { onNavigate(item.key) }, badge, badgeColor)
             }
-            DrawerDivider()
-            val about = navItem("about")
-            val privacy = navItem("privacy")
-            DrawerRow(about, current == about.key, onClick = { onNavigate(about.key) })
-            DrawerRow(privacy, current == privacy.key, onClick = { onNavigate(privacy.key) })
-            DrawerDivider()
-            DrawerRow(NavItem("update", "检查更新", Glyph.UPDATE, ui.sub), false, onClick = { onCheckUpdate() })
-            DrawerRow(navItem("theme"), false, onClick = { onThemeClick() })
-
-            Spacer(Modifier.height(20.dp))
-            // 版本号统一走 BuildConfig，避免手写成「1.1.4」和关于页对不上
-            Text(
-                "Time Leak ${BuildConfig.VERSION_NAME}",
-                fontSize = 11.sp,
-                color = ui.sub,
-            )
-            Spacer(Modifier.height(6.dp))
-            Text("不上传 · 无统计 · 拦截明细只留内存", fontSize = 11.sp, color = ui.sub)
         }
+        DrawerDivider()
+        val about = navItem("about")
+        val privacy = navItem("privacy")
+        DrawerRow(about, current == about.key, onClick = { onNavigate(about.key) })
+        DrawerRow(privacy, current == privacy.key, onClick = { onNavigate(privacy.key) })
+        DrawerDivider()
+        DrawerRow(NavItem("update", "检查更新", Glyph.UPDATE, ui.sub), false, onClick = { onCheckUpdate() })
+        DrawerRow(navItem("theme"), false, onClick = { onThemeClick() })
 
-        // 底部固定页脚：最底居中标注来源与项目地址
-        Column(
-            modifier = Modifier
+        Spacer(Modifier.height(20.dp))
+        Text("不上传 · 无统计 · 拦截明细只留内存", fontSize = 11.sp, color = ui.sub)
+
+        // 来源块：原来是固定页脚，现在跟在列表后面一起滚
+        Spacer(Modifier.height(22.dp))
+        Box(
+            Modifier
                 .fillMaxWidth()
-                .padding(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 18.dp),
+                .height(1.dp)
+                .background(ui.line),
+        )
+        Spacer(Modifier.height(14.dp))
+        Column(
+            modifier = Modifier.fillMaxWidth(),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .height(1.dp)
-                    .background(ui.line),
-            )
-            Spacer(Modifier.height(12.dp))
             Text("来自—xyzOvO", fontSize = 11.sp, color = ui.sub)
             Spacer(Modifier.height(6.dp))
             Text(
@@ -143,10 +130,12 @@ fun AppDrawerContent(
             Spacer(Modifier.height(2.dp))
             Text("v${BuildConfig.VERSION_NAME}", fontSize = 10.sp, color = ui.sub.copy(alpha = 0.7f))
         }
+        // 滚到底时留一点呼吸空间，不贴着屏幕边缘
+        Spacer(Modifier.height(10.dp))
     }
 }
 
-/** 侧栏底部展示并跳转的项目地址。 */
+/** 侧栏展示并跳转的项目地址。 */
 private const val REPO_URL = "https://github.com/xyzOvO/TimeLeak"
 
 @Composable
