@@ -12,6 +12,7 @@ object DnsWire {
     private const val KEEP_OPCODE_AND_RD = 0x7900
     private const val FLAG_RA = 0x0080
     private const val RCODE_NXDOMAIN = 0x0003
+    private const val RCODE_SERVFAIL = 0x0002
 
     data class Query(
         val name: String,
@@ -35,6 +36,22 @@ object DnsWire {
         val out = ByteArray(query.questionEnd)
         System.arraycopy(msg, 0, out, 0, query.questionEnd)
         val flags = FLAG_QR or (u16(msg, 2) and KEEP_OPCODE_AND_RD) or FLAG_RA or RCODE_NXDOMAIN
+        setU16(out, 2, flags)
+        setU16(out, 6, 0)
+        setU16(out, 8, 0)
+        setU16(out, 10, 0)
+        return out
+    }
+
+    /**
+     * 上游解析失败时回 SERVFAIL，取代「静默丢包」。
+     * 静默丢包会让客户端一直等超时再重试，形成查询风暴（实测 16 小时 124 万次拦截）；
+     * SERVFAIL 让客户端立刻失败退避，不再傻等。rcode / 长度构造与 nxDomain 完全对称。
+     */
+    fun servfail(msg: ByteArray, query: Query): ByteArray {
+        val out = ByteArray(query.questionEnd)
+        System.arraycopy(msg, 0, out, 0, query.questionEnd)
+        val flags = FLAG_QR or (u16(msg, 2) and KEEP_OPCODE_AND_RD) or FLAG_RA or RCODE_SERVFAIL
         setU16(out, 2, flags)
         setU16(out, 6, 0)
         setU16(out, 8, 0)

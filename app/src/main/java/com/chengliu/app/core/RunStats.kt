@@ -7,7 +7,10 @@ import kotlinx.coroutines.flow.StateFlow
 import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.LinkedHashMap
 import java.util.Locale
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * 运行统计：按自然日分桶，跨天自动归零。
@@ -18,6 +21,10 @@ import java.util.Locale
  *  - 「过滤规则命中来源」= 今日每次拦截按其命中名单累计的次数分布。
  *
  * 落盘的只有数字、放行域名和不含界面文案的摘要；界面按钮文字只进内存观察记录。
+ *
+ * 旧实现每次拦截都要把整个 sources JSON 从 SP 读出来解析、改一个数、再序列化写回，
+ * 外加一次全量 publish() 重读；124 万次拦截就是 124 万次这样的 JSON 风暴。
+ * 现改为内存里累加，每 5 秒批量落盘一次；StateFlow 仍实时更新。
  */
 object RunStats {
 
@@ -54,43 +61,57 @@ object RunStats {
     private val _state = MutableStateFlow(Snapshot())
     val state: StateFlow<Snapshot> get() = _state
 
+    // 内存态：所有读写都先动这里，落盘交给定时器，避免每条包都碰 SP。
+    @Volatile
+    private var memDay: String = ""
+    private val sourcesMem = LinkedHashMap<String, Long>()
+    private val allowedMem = LinkedHashSet<String>()
+    private var skipMem = 0
+    private var observedMem = 0
+    private var lastSkipMem: LastSkip? = null
+
+    private val flusher = Executors.newSingleThreadScheduledExecutor { r ->
+        val t = Thread(r, "chengliu-runstats-flush")
+        t.isDaemon = true
+        t
+    }
+
+    @Synchronized
     fun init(ctx: Context) {
+        // 多处会调用 init；只初始化一次，避免重复起刷盘线程、也避免把内存里已累加的数字覆盖掉。
+        if (sp != null) return
         sp = ctx.applicationContext.getSharedPreferences(SP_NAME, Context.MODE_PRIVATE)
-        ensureDay()
-        publish()
+        loadFromSp()
+        flusher.scheduleAtFixedRate({ flush() }, 5, 5, TimeUnit.SECONDS)
     }
 
     private fun today(): String = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
 
-    private fun ensureDay() {
+    @Synchronized
+    private fun loadFromSp() {
         val p = sp ?: return
         val d = today()
         if (p.getString("day", "") != d) {
-            p.edit()
-                .putString("day", d)
-                .remove("allowed_set")
-                .putString("sources", "{}")
-                .putInt("skip", 0)
-                .putInt("observed", 0)
-                .remove("last_skip")
-                .apply()
-        }
-    }
-
-    private fun publish() {
-        val p = sp
-        if (p == null) {
-            _state.value = Snapshot()
+            // 跨天：内存清零，但把旧的一天先落盘（其实旧值没变，这里只是确保 day 标记正确）
+            memDay = d
+            sourcesMem.clear()
+            allowedMem.clear()
+            skipMem = 0
+            observedMem = 0
+            lastSkipMem = null
             return
         }
-        val q = Counters.today.value
-        val set = p.getStringSet("allowed_set", emptySet()) ?: emptySet()
-        val sources = LinkedHashMap<String, Long>()
+        memDay = d
+        sourcesMem.clear()
         runCatching {
             val o = JSONObject(p.getString("sources", "{}") ?: "{}")
-            o.keys().forEach { k -> sources[k] = o.optLong(k, 0L) }
+            o.keys().forEach { k -> sourcesMem[k] = o.optLong(k, 0L) }
         }
-        val last = runCatching {
+        allowedMem.clear()
+        allowedMem.addAll(p.getStringSet("allowed_set", emptySet()) ?: emptySet())
+        skipMem = p.getInt("skip", 0)
+        observedMem = p.getInt("observed", 0)
+        lastSkipMem = runCatching {
             val raw = p.getString("last_skip", "") ?: ""
             if (raw.isBlank()) null else {
                 val o = JSONObject(raw)
@@ -101,52 +122,58 @@ object RunStats {
                 )
             }
         }.getOrNull()
+    }
+
+    /** 跨天检测：与 Counters 同理，只在偶发边界加锁重置，并把旧值落盘一次。 */
+    @Synchronized
+    private fun ensureDay() {
+        val d = today()
+        if (d == memDay) return
+        flushLocked()
+        memDay = d
+        sourcesMem.clear()
+        allowedMem.clear()
+        skipMem = 0
+        observedMem = 0
+        lastSkipMem = null
+    }
+
+    /** 构建当前快照：只读内存 + Counters，不再读整个 SP。 */
+    @Synchronized
+    private fun publish() {
+        val q = Counters.today.value
         _state.value = Snapshot(
-            date = p.getString("day", today()) ?: today(),
+            date = memDay.ifEmpty { today() },
             queries = q.first,
             blocked = q.second,
             bypass = Counters.bypass.value,
-            allowedDomains = set.size,
-            allowedCapped = set.size >= MAX_DOMAINS,
-            skipClicks = p.getInt("skip", 0),
-            observed = p.getInt("observed", 0),
-            sources = sources,
-            lastSkip = last,
+            allowedDomains = allowedMem.size,
+            allowedCapped = allowedMem.size >= MAX_DOMAINS,
+            skipClicks = skipMem,
+            observed = observedMem,
+            sources = LinkedHashMap(sourcesMem),
+            lastSkip = lastSkipMem,
         )
     }
 
     /** VPN 放行了一个命中放行规则的域名。 */
     @Synchronized
     fun onAllowed(domain: String) {
-        val p = sp ?: return
         ensureDay()
         if (domain.isBlank()) return
-        val set = (p.getStringSet("allowed_set", emptySet()) ?: emptySet()).toHashSet()
-        if (set.size >= MAX_DOMAINS) {
+        if (allowedMem.size >= MAX_DOMAINS) {
             publish()
             return
         }
-        if (set.add(domain.lowercase())) {
-            p.edit().putStringSet("allowed_set", set).apply()
-        }
-        publish()
+        if (allowedMem.add(domain.lowercase())) publish()
     }
 
-    /** 拦截命中：按来源累计，用于「过滤规则命中来源」。 */
+    /** 拦截命中：按来源累计，用于「过滤规则命中来源」。只动内存，不碰 SP。 */
     @Synchronized
     fun onBlocked(source: String) {
-        val p = sp ?: return
         ensureDay()
         val key = source.ifBlank { "未标注来源" }
-        val m = LinkedHashMap<String, Long>()
-        runCatching {
-            val o = JSONObject(p.getString("sources", "{}") ?: "{}")
-            o.keys().forEach { k -> m[k] = o.optLong(k, 0L) }
-        }
-        m[key] = (m[key] ?: 0L) + 1L
-        val o = JSONObject()
-        m.forEach { (k, v) -> o.put(k, v) }
-        p.edit().putString("sources", o.toString()).apply()
+        sourcesMem[key] = (sourcesMem[key] ?: 0L) + 1L
         publish()
     }
 
@@ -160,39 +187,59 @@ object RunStats {
         action: DecisionAction,
         score: Int,
     ) {
-        val p = sp ?: return
         ensureDay()
-        val e = p.edit()
-        if (action == DecisionAction.CLICK) e.putInt("skip", p.getInt("skip", 0) + 1)
-        if (action == DecisionAction.OBSERVE) e.putInt("observed", p.getInt("observed", 0) + 1)
-        val o = JSONObject()
-        o.put("at", System.currentTimeMillis())
-        o.put("pkg", pkg)
-        o.put("rule", rule)
-        o.put("level", level.label)
-        o.put("kind", kind.label)
-        o.put("action", action.label)
-        o.put("score", score)
-        e.putString("last_skip", o.toString())
-        e.apply()
+        if (action == DecisionAction.CLICK) skipMem++
+        if (action == DecisionAction.OBSERVE) observedMem++
+        lastSkipMem = LastSkip(
+            System.currentTimeMillis(), pkg, rule, level.label, kind.label, action.label, score,
+        )
         publish()
     }
 
     /** Counters 变化时由界面调用，刷新概览里的查询 / 拦截数字。 */
     fun refresh() = publish()
 
+    @Synchronized
+    private fun flushLocked() {
+        val p = sp ?: return
+        val e = p.edit()
+        e.putString("day", memDay.ifEmpty { today() })
+        val o = JSONObject()
+        sourcesMem.forEach { (k, v) -> o.put(k, v) }
+        e.putString("sources", o.toString())
+        e.putStringSet("allowed_set", allowedMem)
+        e.putInt("skip", skipMem)
+        e.putInt("observed", observedMem)
+        lastSkipMem?.let {
+            val j = JSONObject()
+            j.put("at", it.at); j.put("pkg", it.pkg); j.put("rule", it.rule)
+            j.put("level", it.level); j.put("kind", it.kind); j.put("action", it.action)
+            j.put("score", it.score)
+            e.putString("last_skip", j.toString())
+        } ?: e.remove("last_skip")
+        e.apply()
+    }
+
+    /** 定时器调用：把内存态批量写回 SP。 */
+    fun flush() = flushLocked()
+
     /** 只清运行数据，不动配置、名单、订阅与策略。 */
     @Synchronized
     fun clear() {
-        val p = sp ?: return
-        p.edit()
-            .putString("day", today())
-            .remove("allowed_set")
-            .putString("sources", "{}")
-            .putInt("skip", 0)
-            .putInt("observed", 0)
-            .remove("last_skip")
-            .apply()
+        memDay = today()
+        sourcesMem.clear()
+        allowedMem.clear()
+        skipMem = 0
+        observedMem = 0
+        lastSkipMem = null
+        sp?.edit()
+            ?.putString("day", today())
+            ?.remove("allowed_set")
+            ?.putString("sources", "{}")
+            ?.putInt("skip", 0)
+            ?.putInt("observed", 0)
+            ?.remove("last_skip")
+            ?.apply()
         Counters.clear()
         publish()
     }

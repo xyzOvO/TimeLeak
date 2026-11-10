@@ -13,8 +13,8 @@ android {
         // 保持 33：Android 14+ 对 targetSdk>=34 强制前台服务类型声明，
         // 本地工具类应用无需上架，避开这层兼容分支更稳、也更轻。
         targetSdk = 33
-        versionCode = 11
-        versionName = "1.3.2"
+        versionCode = 12
+        versionName = "1.3.3"
     }
 
     buildTypes {

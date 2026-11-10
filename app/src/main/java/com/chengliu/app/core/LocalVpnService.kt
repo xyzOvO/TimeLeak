@@ -15,7 +15,10 @@ import android.net.VpnService
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.system.ErrnoException
+import android.system.Os
 import android.system.OsConstants
+import android.system.StructPollfd
 import android.util.Log
 import com.chengliu.app.BuildConfig
 import com.chengliu.app.MainActivity
@@ -244,14 +247,57 @@ class LocalVpnService : VpnService() {
         val input = FileInputStream(pfd.fileDescriptor)
         val output = FileOutputStream(pfd.fileDescriptor)
         val buf = ByteArray(2048)
+        // 这个 fd 在部分机型（实测 MIUI）上是非阻塞语义：隧道里没包时 read() 立刻返回 0，
+        // 旧代码 `if (n <= 0) continue` 于是变成忙等，单核 100% 空转，实测 16 小时耗电 53%。
+        // 正确做法是先 poll 在内核里睡到可读，超时只为周期性检查 running。
+        val pollFd = StructPollfd().apply {
+            fd = pfd.fileDescriptor
+            events = OsConstants.POLLIN.toShort()
+        }
+        val pollFds = arrayOf(pollFd)
         var seen = 0
+        var emptyReads = 0
         while (running) {
+            val ready = try {
+                Os.poll(pollFds, 1000)
+            } catch (e: ErrnoException) {
+                -1
+            }
+            if (ready < 0) {
+                // fd 已失效（隧道被回收）时 poll 会报错，退避后重试，不要原地打转
+                if (!running) break
+                try {
+                    Thread.sleep(200)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                continue
+            }
+            if (ready == 0) continue
             val n = try {
                 input.read(buf)
             } catch (_: IOException) {
                 break
             }
-            if (n <= 0) continue
+            if (n < 0) {
+                // EOF：连接的隧道已经没了。这里绝不 continue，否则就是死循环。
+                if (running) {
+                    Log.w(TAG, "DNS 读取线程收到 EOF，隧道已失效")
+                    VpnState.setError("DNS 读取线程已退出，请重新开启本地过滤")
+                }
+                break
+            }
+            if (n == 0) {
+                // poll 说可读却读到 0 字节：给一点点让步，连续出现就直接退出
+                if (++emptyReads > 200) break
+                try {
+                    Thread.sleep(2)
+                } catch (_: InterruptedException) {
+                    break
+                }
+                continue
+            }
+            emptyReads = 0
             if (BuildConfig.DEBUG && seen < 20) {
                 seen++
                 val head = (0 until minOf(40, n)).joinToString("") {
@@ -275,8 +321,10 @@ class LocalVpnService : VpnService() {
             // 被旁路路由吸进来的。单独计数，让用户看得见「有人试图绕过」。
             val relayed = !v4.dst.contentEquals(virtualDns4)
             Counters.add(queries = 1L, bypass = if (relayed) 1L else 0L)
-            val answer = answerPayload(v4.payload) ?: return
-            write(output, IpWire.buildIpv4Udp(v4.dst, v4.src, 53, v4.srcPort, answer))
+            val answer = answerPayload(v4.payload) ?: servfailFor(v4.payload)
+            if (answer != null) {
+                write(output, IpWire.buildIpv4Udp(v4.dst, v4.src, 53, v4.srcPort, answer))
+            }
             return
         }
 
@@ -284,12 +332,24 @@ class LocalVpnService : VpnService() {
         if (v6 != null) {
             val relayed = !v6.dst.contentEquals(virtualDns6)
             Counters.add(queries = 1L, bypass = if (relayed) 1L else 0L)
-            val answer = answerPayload(v6.payload) ?: return
-            write(output, IpWire.buildIpv6Udp(v6.dst, v6.src, 53, v6.srcPort, answer))
+            val answer = answerPayload(v6.payload) ?: servfailFor(v6.payload)
+            if (answer != null) {
+                write(output, IpWire.buildIpv6Udp(v6.dst, v6.src, 53, v6.srcPort, answer))
+            }
             return
         }
 
         dropNonDns(packet)
+    }
+
+    /**
+     * 上游解析失败（超时 / 连接错误）时，给客户端回一个 SERVFAIL 而不是不回包。
+     * 不回包会让客户端等超时后重试，把查询量放大成风暴；SERVFAIL 让它立刻失败退避。
+     * 报文本身解析不出合法 query 时返回 null（此时也不该回任何东西）。
+     */
+    private fun servfailFor(raw: ByteArray): ByteArray? {
+        val q = DnsWire.parseQuery(raw, raw.size) ?: return null
+        return DnsWire.servfail(raw, q)
     }
 
     /** 拦截判断 + 上游转发。v4 / v6 共用，避免两条路径的规则慢慢跑偏。 */
@@ -544,8 +604,8 @@ class LocalVpnService : VpnService() {
         Counters.add(blocked = 1L)
         BlockLog.record(name, rule, source)
         // 「过滤规则命中来源」按名单累计次数，界面上能看出是哪一层规则在干活。
+        // onBlocked 内部已经 publish()，这里不必再 refresh() 一遍（每包一次的全量 SP 读取很贵）。
         RunStats.onBlocked(source.label)
-        RunStats.refresh()
         // 前台通知顺带刷新今日数据；节流，避免每个包都重建通知。
         if (Counters.today.value.second % 20L == 0L) refreshNotification()
     }
