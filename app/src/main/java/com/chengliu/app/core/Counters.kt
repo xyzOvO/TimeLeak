@@ -25,6 +25,10 @@ object Counters {
     private val _bypass = MutableStateFlow(0L)
     val bypass: StateFlow<Long> get() = _bypass
 
+    /** 被单域名洪流熔断挡掉的查询数（FloodGuard 吸收的查询风暴）。 */
+    private val _throttled = MutableStateFlow(0L)
+    val throttled: StateFlow<Long> get() = _throttled
+
     @Volatile
     private var sp: SharedPreferences? = null
 
@@ -32,6 +36,7 @@ object Counters {
     private val qMem = AtomicLong(0)
     private val bMem = AtomicLong(0)
     private val rMem = AtomicLong(0)
+    private val tMem = AtomicLong(0)
     @Volatile
     private var memDay: String = ""
 
@@ -47,28 +52,36 @@ object Counters {
         // 只初始化一次，避免重复起刷盘线程、也避免把内存里已累加的数字重新读回 SP 的旧值覆盖掉。
         if (sp != null) return
         sp = ctx.applicationContext.getSharedPreferences("chengliu_counts", Context.MODE_PRIVATE)
-        val (q, b, r) = read()
+        val a = read()
         memDay = LocalDate.now().toString()
-        qMem.set(q); bMem.set(b); rMem.set(r)
-        _today.value = q to b
-        _bypass.value = r
+        qMem.set(a[0]); bMem.set(a[1]); rMem.set(a[2]); tMem.set(a[3])
+        _today.value = qMem.get() to bMem.get()
+        _bypass.value = rMem.get()
+        _throttled.value = tMem.get()
         flusher.scheduleAtFixedRate({ flushLocked() }, 5, 5, TimeUnit.SECONDS)
     }
 
-    private fun read(): Triple<Long, Long, Long> {
-        val p = sp ?: return Triple(0L, 0L, 0L)
-        if (p.getString("day", "") != LocalDate.now().toString()) return Triple(0L, 0L, 0L)
-        return Triple(p.getLong("q", 0), p.getLong("b", 0), p.getLong("r", 0))
+    private fun read(): LongArray {
+        val p = sp ?: return longArrayOf(0, 0, 0, 0)
+        if (p.getString("day", "") != LocalDate.now().toString()) return longArrayOf(0, 0, 0, 0)
+        return longArrayOf(
+            p.getLong("q", 0),
+            p.getLong("b", 0),
+            p.getLong("r", 0),
+            p.getLong("t", 0),
+        )
     }
 
-    fun add(queries: Long = 0, blocked: Long = 0, bypass: Long = 0) {
+    fun add(queries: Long = 0, blocked: Long = 0, bypass: Long = 0, throttled: Long = 0) {
         val day = LocalDate.now().toString()
         if (day != memDay) rollDay(day)
         if (queries != 0L) qMem.addAndGet(queries)
         if (blocked != 0L) bMem.addAndGet(blocked)
         if (bypass != 0L) rMem.addAndGet(bypass)
+        if (throttled != 0L) tMem.addAndGet(throttled)
         _today.value = qMem.get() to bMem.get()
         _bypass.value = rMem.get()
+        _throttled.value = tMem.get()
     }
 
     /** 跨天只在极偶发的边界触发，加锁安全；先把旧的一天落盘再清零内存。 */
@@ -85,7 +98,8 @@ object Counters {
         val p = sp ?: return
         val day = memDay.ifEmpty { LocalDate.now().toString() }
         p.edit().putString("day", day)
-            .putLong("q", qMem.get()).putLong("b", bMem.get()).putLong("r", rMem.get())
+            .putLong("q", qMem.get()).putLong("b", bMem.get())
+            .putLong("r", rMem.get()).putLong("t", tMem.get())
             .apply()
     }
 
@@ -93,10 +107,11 @@ object Counters {
     fun flush() = flushLocked()
 
     fun clear() {
-        qMem.set(0); bMem.set(0); rMem.set(0)
+        qMem.set(0); bMem.set(0); rMem.set(0); tMem.set(0)
         memDay = LocalDate.now().toString()
         _today.value = 0L to 0L
         _bypass.value = 0L
+        _throttled.value = 0L
         flushLocked()
     }
 }

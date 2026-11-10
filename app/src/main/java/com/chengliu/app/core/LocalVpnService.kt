@@ -31,6 +31,11 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.net.InetAddress
 import java.util.concurrent.ExecutorService
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionHandler
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.Executors
 
 /**
@@ -81,8 +86,18 @@ class LocalVpnService : VpnService() {
     private var running = false
     private var reader: Thread? = null
 
-    // 每个查询都会阻塞在一次 socket 收发上，用固定线程池会被上游超时堵死，必须按需扩容
-    private var pool: ExecutorService = Executors.newCachedThreadPool()
+    // 每个查询都会阻塞在一次上游 socket 收发上。旧实现用无界 CachedThreadPool，
+    // 遇到单域名重试风暴（如友盟 430/s）会瞬间 spawn 上千线程 → 线程爆炸 → GC 抖动 → 耗电。
+    // 改成有界线程池：核心 4、最大 32、排队 256，队列满时直接丢弃该包（客户端超时重试），
+    // 绝不无限扩线程。配合 FloodGuard 单域名熔断，洪流下 VPN 自身保持轻量。
+    private var pool: ExecutorService = newPool()
+
+    private fun newPool(): ExecutorService = ThreadPoolExecutor(
+        4, 32, 30L, TimeUnit.SECONDS,
+        LinkedBlockingQueue(256),
+        ThreadFactory { r -> Thread(r, "chengliu-upstream") },
+        RejectedExecutionHandler { _, _ -> /* 极端洪流：丢弃，客户端超时重试，不护线程 */ },
+    )
 
     /** 规则在后台线程解析，回到主线程重建处理器，避免多线程同时改字段。 */
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -188,7 +203,10 @@ class LocalVpnService : VpnService() {
             .addAddress(VPN_ADDRESS6, 64)
             .allowFamily(OsConstants.AF_INET)
             .allowFamily(OsConstants.AF_INET6)
-            .setMtu(1500)
+            // 隧道 MTU 不能照搬以太网 1500：移动数据底层 MTU 常是 1420/1350，
+            // 超过底层会被分片，而不少运营商对 UDP 分片处理很差甚至直接丢。
+            // 1280 是 IPv6 要求的最小 MTU，保证不被分片，对 DNS 小包足够。
+            .setMtu(1280)
 
         if (!strictPdns) {
             // 正常情况下我们就是系统的 DNS：虚拟地址既是本接口地址，也是系统查询的落点。
@@ -222,7 +240,7 @@ class LocalVpnService : VpnService() {
         }
 
         fd = pfd
-        if (pool.isShutdown || pool.isTerminated) pool = Executors.newCachedThreadPool()
+        if (pool.isShutdown || pool.isTerminated) pool = newPool()
         // 隧道重建后网络栈可能已经换了，旧的引导解析器要作废
         bootstrapResolver = null
         cacheUpstream = null
@@ -364,6 +382,14 @@ class LocalVpnService : VpnService() {
             // 命中放行名单的域名单独记一个去重集合，供「被放行的域名数量」展示。
             if (engine.isAllowed(q.name)) RunStats.onAllowed(q.name)
             watch(q.name)
+        }
+
+        // 单域名洪流防护：任意域名每秒查询超阈值就暂停转发、改回 SERVFAIL，
+        // 让客户端立刻失败退避，避免个别 SDK 的重试风暴把上游线程池和 CPU 打爆。
+        // 这是 v1.3.4「放行友盟」的通用版——不再需要为每个抽风的 SDK 单独加白名单。
+        if (q != null && !bootstrap && !FloodGuard.admit(q.name)) {
+            Counters.add(throttled = 1L)
+            return servfailFor(raw)
         }
 
         // 转发前剥掉 ECS：上游不必知道你在哪个区县
@@ -648,10 +674,11 @@ class LocalVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val (q, b) = Counters.today.value
+        val t = Counters.throttled.value
         val encrypt = if (prefs.leakGuard || prefs.upstreamMode == "doh") "加密上游" else "系统上游"
         // 前台通知本身就是「运行状态自检」的最外层：不用打开 App 也能看出
-        // 服务是不是在跑、今天拦了多少、上游走的是不是加密通道。
-        val text = "运行中 · 今日查询 $q / 拦截 $b · $encrypt"
+        // 服务是不是在跑、今天拦了多少、上游走的是不是加密通道、有没有风暴被熔断挡下。
+        val text = "运行中 · 今日查询 $q / 拦截 $b" + (if (t > 0) " / 熔断 $t" else "") + " · $encrypt"
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle(getString(R.string.notif_title))
