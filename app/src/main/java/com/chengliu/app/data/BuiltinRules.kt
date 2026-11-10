@@ -286,5 +286,13 @@ object BuiltinRules {
         "api.slightcommunicativeinterconnectedness.xyz",
         "news-app.abumedia.yql.yahoo.com",
         "ftp.bmp.ovh",
+
+        // 统计上报域放行：友盟（Umeng）SDK 一旦解析不到上报域名，会误判「网络断开」
+        // 并疯狂重试，反向把本 VPN 的 DNS 线程压到 98% 而耗电。
+        // iTime（com.example.countdown）即此情形：拦截 errnewlog.umeng.com 后每秒重试约 430 次。
+        // umeng 属统计/埋点，不是广告投放，放行不会放行广告。ALLOWED 优先级高于 DOMAINS，
+        // 下列条目覆盖本文件 DOMAINS 中同名的 umeng 拦截项。
+        "umeng.com",
+        "umengcloud.com",
     )
 }
