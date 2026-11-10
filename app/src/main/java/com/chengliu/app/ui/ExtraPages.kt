@@ -46,6 +46,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.chengliu.app.core.AppPrefs
 import com.chengliu.app.core.BackupRestore
+import com.chengliu.app.core.BeatResult
+import com.chengliu.app.core.BeatStage
 import com.chengliu.app.core.BlockLog
 import com.chengliu.app.core.Confidence
 import com.chengliu.app.core.Counters
@@ -62,6 +64,8 @@ import com.chengliu.app.core.Reject
 import com.chengliu.app.core.RejectLog
 import com.chengliu.app.core.RecoveryBudget
 import com.chengliu.app.core.RunStats
+import com.chengliu.app.core.ScanBeat
+import com.chengliu.app.core.ScanLog
 import com.chengliu.app.core.ServiceRecovery
 import com.chengliu.app.core.SkipAdState
 import com.chengliu.app.core.SubCheck
@@ -472,12 +476,30 @@ fun ObservePage() {
             ExNote("仅本次运行内存可见，退出即清空，不落盘、不进备份、不上传。观察模式下同一目标 4 秒内只刷新一次。")
             Spacer(Modifier.height(8.dp))
             if (list.isEmpty()) {
-                ExNote("还没有识别记录。打开观察模式并启动任意带开屏广告的应用，这里会显示命中的文本、ID、可点击状态、规则与判定。")
+                ExNote("还没有识别记录。打开观察模式并启动任意带开屏广告的应用，这里会显示命中的文本、ID、可点击状态、规则与判定。" +
+                    "如果一直是空的，往下看「扫描心跳」，那里会写清是没扫到、还是扫到了没认出来。")
             } else {
                 list.forEach { o -> ObservationCard(o) }
             }
             Spacer(Modifier.height(8.dp))
             ExButton("清空识别记录", { ObservationLog.clear() })
+        }
+        Spacer(Modifier.height(12.dp))
+
+        val beats by ScanLog.items.collectAsState()
+        ExCard {
+            ExLabel("扫描心跳 · 最近 ${beats.size} 条")
+            ExNote("每次扫描都留一条，不管有没有命中。空白识别记录到底代表什么，看这里：" +
+                "「节点树为空」是没拿到界面，「没有候选」是拿到了但都不像跳过按钮，" +
+                "「被节流合并」是切应用太快。只存内存，最多 40 条，不记界面文字。")
+            Spacer(Modifier.height(8.dp))
+            if (beats.isEmpty()) {
+                ExNote("还没有扫描记录。确认跳过广告总开关已开，然后从桌面冷启动任意带开屏的应用，这里会出现心跳。")
+            } else {
+                beats.forEach { b -> BeatRow(b) }
+            }
+            Spacer(Modifier.height(8.dp))
+            ExButton("清空心跳记录", { ScanLog.clear() })
         }
         Spacer(Modifier.height(12.dp))
 
@@ -536,6 +558,61 @@ private fun RejectRow(r: Reject) {
             fontSize = 11.sp,
             color = ui.sub,
             lineHeight = 16.sp,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun BeatRow(b: ScanBeat) {
+    val ui = LocalUi.current
+    val color = when (b.result) {
+        BeatResult.HIT -> ui.active
+        BeatResult.NO_TREE, BeatResult.EMPTY, BeatResult.POLICY -> ui.warn
+        else -> ui.sub
+    }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 5.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(ui.bg)
+            .padding(10.dp),
+    ) {
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text(
+                b.appLabel,
+                modifier = Modifier.weight(1f, fill = false),
+                fontSize = 12.sp,
+                color = ui.text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(fmt(b.at), fontSize = 10.sp, color = ui.sub)
+        }
+        Text(
+            buildString {
+                if (b.stage != BeatStage.SKIPPED) append(b.stage.label)
+                if (b.nodes > 0) {
+                    if (isNotEmpty()) append(" · ")
+                    append("节点 ${b.nodes}")
+                }
+                if (b.candidates > 0) {
+                    if (isNotEmpty()) append(" · ")
+                    append("候选 ${b.candidates}")
+                }
+            }.ifEmpty { "未进入扫描" },
+            fontSize = 10.sp,
+            color = ui.sub,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            b.result.label + if (b.note.isNotEmpty()) "：${b.note}" else "",
+            fontSize = 11.sp,
+            color = color,
+            lineHeight = 15.sp,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,
         )

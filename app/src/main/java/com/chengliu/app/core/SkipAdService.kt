@@ -114,6 +114,12 @@ class SkipAdService : AccessibilityService() {
     /** 观察记录按目标去重：key -> 上次记录时间。 */
     private val lastRecordAt = HashMap<String, Long>()
 
+    /** 本轮扫描命中的规则名；扫描结束时用它把心跳结论标成「命中」。 */
+    private var scanHitRule: String? = null
+
+    /** 应用名缓存：心跳每条都要显示应用名，不能每次都问 PackageManager。 */
+    private val labelCache = HashMap<String, String>()
+
     /**
      * 本次扫描期间持有的节点引用。Ref 只存这里的下标，扫描一结束
      * （finally）就逐个 recycle —— AccessibilityNodeInfo 不是普通数据对象，
@@ -327,19 +333,36 @@ class SkipAdService : AccessibilityService() {
     private fun scan(pkg: String, activity: String?, force: Boolean) {
         if (SKIP_PKGS.contains(pkg) || pkg == packageName) return
         val now = System.currentTimeMillis()
-        if (scanning) return
+        if (scanning) {
+            // content-changed 触发的重复扫描不记心跳，否则列表会被「被节流合并」刷满。
+            if (force) beat(now, pkg, 0, 0, BeatStage.SKIPPED, BeatResult.THROTTLED, "上一次扫描还没结束")
+            return
+        }
         // 一律节流：界面不可能在 200ms 内变出新的跳过按钮，重复全树遍历只会掉帧
-        if (now - lastScanAt < 200) return
+        if (now - lastScanAt < 200) {
+            if (force) beat(now, pkg, 0, 0, BeatStage.SKIPPED, BeatResult.THROTTLED, "切应用太快，这一轮没扫")
+            return
+        }
         scanning = true
         scanNodes.clear()
         val deadline = android.os.SystemClock.elapsedRealtime() + SCAN_TIMEOUT_MS
         scanDeadline = deadline
+        scanHitRule = null
+        // 心跳结论先按「扫完未命中」兜底，各分支只负责改写它。
+        var beatPkg = pkg
+        var beatStage = BeatStage.NORMAL
+        var beatResult = BeatResult.DONE
+        var beatNote = ""
+        var nodeCount = 0
+        var candidateCount = 0
         try {
             lastScanAt = now
             val root = rootInActiveWindow
             // root 也是本次扫描的短期引用，finally 里和所有子节点一起释放。
             if (root != null) scanNodes.add(root)
             if (root == null) {
+                beatResult = BeatResult.NO_TREE
+                beatNote = "拿不到窗口内容"
                 if (force) android.util.Log.d("SkipAd", "扫描 $pkg 跳过: 拿不到窗口内容")
                 return
             }
@@ -347,7 +370,13 @@ class SkipAdService : AccessibilityService() {
             val inPoll = windowAge <= SPLASH_POLL_MS
             // 事件里的包名可能是上一个窗口的（切回本应用时尤其明显），以窗口根节点的包名为准
             val realPkg = root.packageName?.toString() ?: pkg
-            if (realPkg == packageName || SKIP_PKGS.contains(realPkg)) return
+            beatPkg = realPkg
+            beatStage = if (inPoll) BeatStage.SPLASH else BeatStage.POPUP
+            if (realPkg == packageName || SKIP_PKGS.contains(realPkg)) {
+                beatResult = BeatResult.SELF
+                beatNote = "窗口属于系统或本应用"
+                return
+            }
             if (realPkg != policyPkg || now - policyAt > 5000) {
                 currentPolicy = SkipPolicyStore.forPkg(this, realPkg)
                 policyPkg = realPkg
@@ -357,6 +386,8 @@ class SkipAdService : AccessibilityService() {
             if (policy.mode == PolicyMode.DISABLED && !observe) {
                 // 银行 / 支付类：连窗口内容都不看，也不要留任何误点的可能。
                 // 观察模式例外：只识别、只记录，依然不会执行任何点击。
+                beatResult = BeatResult.POLICY
+                beatNote = "应用策略为不自动点击"
                 if (force) {
                     android.util.Log.d("SkipAd", "扫描 $realPkg 跳过: 该应用策略为不自动点击")
                 }
@@ -365,10 +396,22 @@ class SkipAdService : AccessibilityService() {
             scanPopupRound = !inPoll
             if (!inPoll) {
                 // 开屏窗之外只靠事件驱动，不延长主动轮询；弹窗轮单独节流
-                if (!policy.mode.popup && !observe) return
-                if (now - lastPopupScanAt < 1000) return
+                if (!policy.mode.popup && !observe) {
+                    beatResult = BeatResult.OUTSIDE
+                    beatNote = "该应用未开启弹窗轮"
+                    return
+                }
+                if (now - lastPopupScanAt < 1000) {
+                    beatResult = BeatResult.THROTTLED
+                    beatNote = "弹窗轮 1 秒内已扫过"
+                    return
+                }
                 lastPopupScanAt = now
-                if (now - lastInteractAt < 900 && !observe) return
+                if (now - lastInteractAt < 900 && !observe) {
+                    beatResult = BeatResult.BUSY
+                    beatNote = "用户在 900ms 内操作过"
+                    return
+                }
             }
             // 开屏场景按整个 12 秒窗口算（倒计时结束后才出现的按钮也属于开屏），
             // 但订阅 / 文本推断只在前 9 秒做，两者不能混为一谈。
@@ -389,10 +432,24 @@ class SkipAdService : AccessibilityService() {
                     "扫描 $realPkg 节点=${refs.size} 开屏窗=${windowAge}ms 策略=${policy.mode}",
                 )
             }
-            if (refs.isEmpty()) return
+            nodeCount = refs.size
+            // 候选 = 有文案或 id、够窄、且不是业务按钮。这个数字是心跳里最有用的，
+            // 它能直接回答「到底是没扫到，还是扫到了但没有一个算候选」。
+            candidateCount = refs.count { r ->
+                (r.text.isNotEmpty() || r.desc.isNotEmpty() || r.id.isNotEmpty()) &&
+                    r.bounds.width() < screen.width() * NARROW_RATIO &&
+                    SkipEngine.isSafeTarget(r.text, r.desc)
+            }
+            if (refs.isEmpty()) {
+                beatResult = BeatResult.EMPTY
+                beatNote = "这一轮没拿到任何节点"
+                return
+            }
 
             if (!inPoll) {
                 scanPopup(refs, screen, now)
+                beatResult = BeatResult.NO_CANDIDATE
+                beatNote = "弹窗轮没有唯一关闭候选"
                 return
             }
 
@@ -413,7 +470,11 @@ class SkipAdService : AccessibilityService() {
             if (scanExplicit(refs, screen, now)) return
 
             // 文本推断只在前 9 秒内做
-            if (!inTextWindow) return
+            if (!inTextWindow) {
+                beatResult = BeatResult.TEXT_OVER
+                beatNote = "超过 9 秒文本窗，只跑了明确信号轮"
+                return
+            }
 
             // 用户自己写死的弹窗规则（触发 -> 动作）
             for (p in SkipEngine.popups()) {
@@ -450,13 +511,53 @@ class SkipAdService : AccessibilityService() {
                     null -> {}
                 }
             }
+            beatResult = BeatResult.NO_CANDIDATE
+            beatNote = "开屏窗内没有符合条件的跳过目标"
         } finally {
+            // 任何一条 return 路径都会走到这里，所以心跳只在这一个地方写，
+            // 不会因为新增分支而漏记。命中优先于「没有候选」的兜底结论。
+            if (scanHitRule != null) {
+                beatResult = BeatResult.HIT
+                beatNote = scanHitRule.orEmpty()
+            }
+            beat(now, beatPkg, nodeCount, candidateCount, beatStage, beatResult, beatNote)
             // 扫描完成：把本次持有的所有节点引用一次性释放。
             // AccessibilityNodeInfo 是跨进程句柄，不能当普通对象缓存到下一轮。
             for (n in scanNodes) runCatching { n.recycle() }
             scanNodes.clear()
             scanning = false
         }
+    }
+
+    /** 写一条扫描心跳。只在内存，最多 40 条，同一应用同一结论 10 秒内合并。 */
+    private fun beat(
+        at: Long,
+        pkg: String,
+        nodes: Int,
+        candidates: Int,
+        stage: BeatStage,
+        result: BeatResult,
+        note: String,
+    ) {
+        // 切回自己时的那一轮没有任何信息量，界面里不出现，logcat 仍有窗口日志。
+        if (result == BeatResult.SELF) return
+        ScanLog.add(
+            ScanBeat(
+                at = at,
+                pkg = pkg,
+                appLabel = labelOf(pkg),
+                nodes = nodes,
+                candidates = candidates,
+                stage = stage,
+                result = result,
+                note = note,
+            ),
+        )
+    }
+
+    /** 应用名只查一次，之后走缓存；查不到就直接显示包名。 */
+    private fun labelOf(pkg: String): String = labelCache.getOrPut(pkg) {
+        runCatching { SkipPolicyStore.displayName(this, pkg) }.getOrDefault(pkg)
     }
 
     /**
@@ -787,7 +888,10 @@ class SkipAdService : AccessibilityService() {
 
     private fun doBack(now: Long): Boolean {
         // 观察模式下连返回键都不按，只识别不执行。
-        if (observe) return false
+        if (observe) {
+            scanHitRule = "back:观察模式未执行"
+            return false
+        }
         if (now < cooldownUntil) return false
         if (now - lastBackAt < 800) return false
         if (sessionClicks >= MAX_SESSION_CLICKS) return false
@@ -807,6 +911,7 @@ class SkipAdService : AccessibilityService() {
     }
 
     private fun mark(key: String, now: Long, d: Decision) {
+        scanHitRule = d.rule
         lastClickKey = key
         lastClickAt = now
         sessionClicks++
