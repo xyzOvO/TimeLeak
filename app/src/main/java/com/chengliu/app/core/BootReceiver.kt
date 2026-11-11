@@ -17,6 +17,8 @@ class BootReceiver : BroadcastReceiver() {
             action != "android.intent.action.QUICKBOOT_POWERON"
         ) return
         val prefs = AppPrefs(ctx)
+        // 跳过广告的保活不依赖 VPN 开机恢复：开关开着就把进程钉在前台。
+        if (prefs.skipAdEnabled) SkipGuardService.ensure(ctx)
         if (!prefs.bootRestore) return
         if (runCatching { VpnService.prepare(ctx) == null }.getOrDefault(false).not()) {
             HealthNotifier.notifyOnce(

@@ -62,6 +62,11 @@ class SkipAdService : AccessibilityService() {
     private var lastClickKey = ""
     private var lastClickAt = 0L
 
+    /** 上次点击控件「不含位置」的标识与左上角，用来按容差认同一个控件。 */
+    private var lastClickBase = ""
+    private var lastClickLeft = 0
+    private var lastClickTop = 0
+
     /** 同一个控件本次窗口内点了几次。 */
     private val clickCounts = HashMap<String, Int>()
 
@@ -89,6 +94,7 @@ class SkipAdService : AccessibilityService() {
     /** 应用内弹窗每个会话最多关一次，且必须避开用户正在操作的时候。 */
     private var popupClicks = 0
     private var lastPopupScanAt = 0L
+
     private var lastRejectLogAt = 0L
 
     // ---------------- 评分 / 观察 / 冷却 / 扫描优化 ----------------
@@ -129,11 +135,27 @@ class SkipAdService : AccessibilityService() {
 
     /** 内容变化事件的短时合并：120ms 内的连续变化只扫一次。 */
     private var pendingScanPkg: String? = null
-    private val pendingScan = Runnable {
-        val pkg = pendingScanPkg ?: return@Runnable
-        pendingScanPkg = null
-        if (!prefs.skipAdEnabled) return@Runnable
-        scan(pkg, curAct, force = false)
+    // 用对象表达式 + this 重排自己：在 Runnable lambda 里直接引用同名 val
+    // 会让编译器报「Variable must be initialized」。
+    private val pendingScan: Runnable = object : Runnable {
+        override fun run() {
+            val pkg = pendingScanPkg ?: return
+            if (!prefs.skipAdEnabled) {
+                pendingScanPkg = null
+                return
+            }
+            // 合并后的这一轮若撞上扫描节流，必须重排一次：跳过按钮常常是
+            // 「延迟渲染」后才出现，那次内容变化事件被丢掉就再也不会扫了。
+            val now = System.currentTimeMillis()
+            val wait = scanGap(now) - (now - lastScanAt)
+            if (wait > 0) {
+                handler.removeCallbacks(this)
+                handler.postDelayed(this, wait)
+                return
+            }
+            pendingScanPkg = null
+            scan(pkg, curAct, force = false)
+        }
     }
 
     /**
@@ -146,7 +168,12 @@ class SkipAdService : AccessibilityService() {
                 isPolling = false
                 return
             }
-            handler.postDelayed(this, POLL_MS)
+            // 跳过按钮常在开屏后 0~3 秒才延迟渲染，这段窗口内把轮询压到
+            // POLL_FAST_MS，按钮一出现就能扫到。命中后或 3 秒之后回落到
+            // 常规间隔，避免整个 12 秒开屏窗都高频取树。
+            val now = System.currentTimeMillis()
+            val fast = sessionClicks == 0 && now - windowAt <= POLL_FAST_WINDOW_MS
+            handler.postDelayed(this, if (fast) POLL_FAST_MS else POLL_MS)
         }
     }
 
@@ -156,6 +183,8 @@ class SkipAdService : AccessibilityService() {
         // 只有走到这里，才说明本进程确实收到了系统的绑定，界面据此显示「正在工作」。
         stateToken = SkipAdState.onConnected()
         android.util.Log.i("SkipAd", "无障碍服务已连上")
+        // 系统重新绑定成功时补一次保活，避免之后又被省电策略回收。
+        SkipGuardService.ensure(this)
         observe = prefs.observeMode
         SkipEngine.builtin = prefs.skipBuiltin
         lastCache = prefs.skipSubCache
@@ -214,14 +243,18 @@ class SkipAdService : AccessibilityService() {
                 if (pkg != curPkg) {
                     handler.removeCallbacks(pendingScan)
                     pendingScanPkg = null
-                    handleWindow(pkg, curAct ?: "", now)
+                    // 这条兜底路径拿不到 Activity，绝不能把上一个 App 的
+                    // className 带过来；传空串让 scopedHit 按「宁可漏点」处理。
+                    handleWindow(pkg, "", now)
                     return
                 }
                 // 短时间合并：倒计时文本每秒变、列表滚动连发事件，
                 // 120ms 内的连续内容变化只做一次全树遍历。
                 pendingScanPkg = pkg
                 handler.removeCallbacks(pendingScan)
-                handler.postDelayed(pendingScan, SCAN_MERGE_MS)
+                // 开屏初期按钮刚渲染，把合并窗口压短，别白等一整轮。
+                val mergeMs = if (inFastWindow(now)) SCAN_MERGE_FAST_MS else SCAN_MERGE_MS
+                handler.postDelayed(pendingScan, mergeMs)
             }
 
             // 其它事件在函数开头已被 return 掉；这里显式收尾，避免 lint 的 SwitchIntDef 告警。
@@ -285,9 +318,13 @@ class SkipAdService : AccessibilityService() {
             sessionClicks = 0
             clickCounts.clear()
             lastClickKey = ""
+            lastClickBase = ""
             popupClicks = 0
             cooldownUntil = 0L
             evidence.clear()
+            // key 是 id|text|desc 组合，跨 App 只增不减；服务是长期进程，
+            // 换窗口时清掉，避免观察记录去重表无界增长。
+            lastRecordAt.clear()
             startPolling()
         }
         scan(pkg, act, force = true)
@@ -309,6 +346,17 @@ class SkipAdService : AccessibilityService() {
         handler.removeCallbacks(pendingScan)
         pendingScanPkg = null
     }
+
+    /**
+     * 开屏最初的「按钮延迟渲染期」。命中过一次就退出：首点之后只剩
+     * CLICK_GAP_MS=800 的失败重试，常规 700ms 轮询足够，不必继续高频取树。
+     */
+    private fun inFastWindow(now: Long): Boolean =
+        sessionClicks == 0 && now - windowAt <= POLL_FAST_WINDOW_MS
+
+    /** 非强制扫描的最小间隔；只在开屏初期放宽，其余时间保持 200ms 省电。 */
+    private fun scanGap(now: Long): Long =
+        if (inFastWindow(now)) SCAN_GAP_FAST_MS else SCAN_GAP_MS
 
     /** @return true 表示还要继续轮询。 */
     private fun autoPoll(): Boolean {
@@ -341,11 +389,9 @@ class SkipAdService : AccessibilityService() {
             if (force) beat(now, pkg, 0, 0, BeatStage.SKIPPED, BeatResult.THROTTLED, "上一次扫描还没结束")
             return
         }
-        // 一律节流：界面不可能在 200ms 内变出新的跳过按钮，重复全树遍历只会掉帧
-        if (now - lastScanAt < 200) {
-            if (force) beat(now, pkg, 0, 0, BeatStage.SKIPPED, BeatResult.THROTTLED, "切应用太快，这一轮没扫")
-            return
-        }
+        // 事件合并的重复扫描节流即可；换窗口的强制扫描是新一轮开屏唯一的
+        // 一次立即扫描，绝不能被上一个窗口留下的 lastScanAt 挡掉。
+        if (!force && now - lastScanAt < scanGap(now)) return
         scanning = true
         scanNodes.clear()
         val deadline = android.os.SystemClock.elapsedRealtime() + SCAN_TIMEOUT_MS
@@ -378,6 +424,7 @@ class SkipAdService : AccessibilityService() {
             if (realPkg == packageName || SKIP_PKGS.contains(realPkg)) {
                 beatResult = BeatResult.SELF
                 beatNote = "窗口属于系统或本应用"
+                android.util.Log.i("SkipAd", "扫描跳过: 活动窗口=$realPkg 事件包名=$pkg force=$force")
                 return
             }
             if (realPkg != policyPkg || now - policyAt > 5000) {
@@ -429,12 +476,10 @@ class SkipAdService : AccessibilityService() {
             scanScreenH = screen.height()
             val refs = ArrayList<Ref>(64)
             collect(root, refs, 0, screen, deadline, 0)
-            if (force) {
-                android.util.Log.d(
-                    "SkipAd",
-                    "扫描 $realPkg 节点=${refs.size} 开屏窗=${windowAge}ms 策略=${policy.mode}",
-                )
-            }
+            android.util.Log.i(
+                "SkipAd",
+                "扫描 $realPkg 节点=${refs.size} 开屏窗=${windowAge}ms 策略=${policy.mode} force=$force",
+            )
             nodeCount = refs.size
             // 候选 = 有文案或 id、够窄、且不是业务按钮。这个数字是心跳里最有用的，
             // 它能直接回答「到底是没扫到，还是扫到了但没有一个算候选」。
@@ -644,14 +689,15 @@ class SkipAdService : AccessibilityService() {
         val desc = node.contentDescription?.toString()?.trim().orEmpty()
         val id = node.viewIdResourceName ?: ""
         val cls = node.className?.toString()?.trim().orEmpty()
+        val clickable = node.isClickable
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
         if (text.isNotEmpty() || desc.isNotEmpty() || id.isNotEmpty()) {
-            val rect = Rect()
-            node.getBoundsInScreen(rect)
             // 不可见的节点永远不点：广告 SDK 常放一个 0×0 或屏幕外的假跳过按钮
             if (node.isVisibleToUser && rect.width() > 0 && rect.height() > 0 &&
                 Rect.intersects(rect, screen)
             ) {
-                out.add(Ref(index, text, desc, id, rect, cls, node.isClickable))
+                out.add(Ref(index, text, desc, id, rect, cls, clickable))
             }
         }
         val n = node.childCount
@@ -673,13 +719,22 @@ class SkipAdService : AccessibilityService() {
      */
     private fun click(ref: Ref, now: Long, reason: HitReason): Boolean {
         // 倒计时文本每秒都在变（"跳过 5s" -> "跳过 4s"），直接拿原文当 key
-        // 等于没有判重。去掉数字和空白后才是同一个控件。
-        val key = ref.id + "|" + ref.text.replace(NUM, "") + "|" + ref.desc.replace(NUM, "")
+        // 等于没有判重。去掉数字和空白后才是同一个控件；再带上位置，
+        // 让同文案但不同位置的控件彼此可区分（下面用 16px 容差认同一个按钮）。
+        val base = ref.id + "|" + ref.text.replace(NUM, "") + "|" + ref.desc.replace(NUM, "")
+        val key = base + "|" + ref.bounds.left + "," + ref.bounds.top
+        // 倒计时从「跳过 10s」变「跳过 9s」时按钮常会左右挪几像素，而点击前的
+        // 二次验证允许 16px 漂移；判重也必须按同一容差认作同一个控件，否则
+        // key 一变，「点完没跳走再试一次」就永远轮不到。
+        val sameAsLast = ClickTarget.same(
+            base, ref.bounds.left, ref.bounds.top,
+            lastClickBase, lastClickLeft, lastClickTop,
+        )
         if (!observe) {
             if (sessionClicks >= MAX_SESSION_CLICKS) return false
             if ((clickCounts[key] ?: 0) >= MAX_SAME_CLICKS) return false
             // 本窗口已经点过一次，就只允许对「同一个控件」重试。
-            if (sessionClicks >= 1 && key != lastClickKey) return false
+            if (sessionClicks >= 1 && key != lastClickKey && !sameAsLast) return false
             if (now - lastClickAt < CLICK_GAP_MS) return false
         }
 
@@ -687,7 +742,7 @@ class SkipAdService : AccessibilityService() {
         val label = ref.text.ifEmpty { ref.desc }
         val age = now - windowAt
         val kind = SkipEngine.classify(
-            ref.text, ref.desc, ref.id, ref.cls, b,
+            ref.text, ref.desc, ref.id, b,
             scanScreenW, scanScreenH, scanInSplash, reason,
         )
         val facts = NodeFacts(
@@ -772,7 +827,7 @@ class SkipAdService : AccessibilityService() {
         if (d.action != DecisionAction.CLICK) {
             if (now - lastRejectLogAt > 2000) {
                 lastRejectLogAt = now
-                android.util.Log.d(
+                android.util.Log.i(
                     "SkipAd",
                     "未点击: ${d.level.label} 分数=${d.score} 类型=${d.kind} " +
                         "证据=$reason 策略=${currentPolicy.mode} 规则=${d.rule} " +
@@ -802,7 +857,7 @@ class SkipAdService : AccessibilityService() {
         val fresh = Rect()
         val denied = verifyBeforeClick(ref, node, fresh)
         if (denied != null) {
-            android.util.Log.d("SkipAd", "二次验证未通过: $denied")
+            android.util.Log.i("SkipAd", "二次验证未通过: $denied")
             RejectLog.add(
                 Reject(
                     at = now,
@@ -826,7 +881,7 @@ class SkipAdService : AccessibilityService() {
             if (cur.isClickable && cur.isEnabled &&
                 cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)
             ) {
-                mark(key, now, d)
+                mark(key, base, ref.bounds.left, ref.bounds.top, now, d)
                 return true
             }
             val parent = cur.parent
@@ -836,7 +891,7 @@ class SkipAdService : AccessibilityService() {
             depth++
         }
 
-        // 自绘控件既不可点也拿不到可点击祖先，退化成按坐标点一下。
+        // 控件本身与可点击祖先都点不动时，退化成按坐标点一下。
         // 坐标用二次验证时重新读到的位置，不用扫描时的旧值。
         if (now - lastGestureAt > 700 && fresh.width() > 20 && fresh.height() > 20) {
             val path = Path().apply { moveTo(fresh.exactCenterX(), fresh.exactCenterY()) }
@@ -845,7 +900,7 @@ class SkipAdService : AccessibilityService() {
                 .build()
             lastGestureAt = now
             if (dispatchGesture(gesture, null, null)) {
-                mark(key, now, d)
+                mark(key, base, ref.bounds.left, ref.bounds.top, now, d)
                 return true
             }
         }
@@ -903,6 +958,7 @@ class SkipAdService : AccessibilityService() {
         lastBackAt = now
         lastClickAt = now
         lastClickKey = "back"
+        lastClickBase = ""
         sessionClicks++
         cooldownUntil = now + Weights.COOLDOWN_MS
         prefs.bumpSkip()
@@ -913,14 +969,22 @@ class SkipAdService : AccessibilityService() {
         return true
     }
 
-    private fun mark(key: String, now: Long, d: Decision) {
+    private fun mark(
+        key: String, base: String, left: Int, top: Int, now: Long, d: Decision,
+    ) {
         scanHitRule = d.rule
         lastClickKey = key
+        lastClickBase = base
+        lastClickLeft = left
+        lastClickTop = top
         lastClickAt = now
         sessionClicks++
         clickCounts[key] = (clickCounts[key] ?: 0) + 1
         // 规则冷却：点击成功后 2 秒内同窗口不再点；窗口变化会清零。
         cooldownUntil = now + Weights.COOLDOWN_MS
+        // 点过一次之后，本窗口余下的轮询不再是「新窗口会话」，
+        // 否则 freshWindow 会一直为 true，把冷却判定在决策层抵消掉。
+        windowFresh = false
         evidence.clear()
         prefs.bumpSkip()
         android.util.Log.i(
@@ -977,8 +1041,16 @@ class SkipAdService : AccessibilityService() {
         /** 轮询持续时长。比文本层长一点，覆盖「广告图先出、跳过按钮后出」。 */
         const val SPLASH_POLL_MS = 12000L
 
-        /** 主动轮询间隔。700ms 兼顾命中速度与耗电。 */
+        /** 常规主动轮询间隔。700ms 兼顾命中速度与耗电。 */
         const val POLL_MS = 700L
+
+        /**
+         * 开屏最初 3 秒的高频轮询。广告图先出、跳过按钮延迟渲染是常态，
+         * 这段窗口内 200ms 一轮，按钮出现后最坏等待从 700ms 降到 200ms；
+         * 3 秒后或成功命中后立刻回落到 [POLL_MS]，不增加常驻耗电。
+         */
+        const val POLL_FAST_MS = 200L
+        const val POLL_FAST_WINDOW_MS = 3000L
 
         /** 首次轮询延时，避开 OEM 启动过渡里的上一帧快照。 */
         const val FIRST_POLL_DELAY_MS = 420L
@@ -995,6 +1067,13 @@ class SkipAdService : AccessibilityService() {
         /** 内容变化事件合并窗口：120ms 内的连续变化只遍历一次节点树。 */
         const val SCAN_MERGE_MS = 120L
 
+        /** 开屏初期按钮刚渲染，合并窗口压到 50ms，别等一整轮。 */
+        const val SCAN_MERGE_FAST_MS = 50L
+
+        /** 非强制扫描的最小间隔：开屏初期 140ms，其余保持 200ms。 */
+        const val SCAN_GAP_MS = 200L
+        const val SCAN_GAP_FAST_MS = 140L
+
         /** 单次遍历超时：超时即停，不让畸形界面拖住主线程。 */
         const val SCAN_TIMEOUT_MS = 120L
 
@@ -1006,8 +1085,8 @@ class SkipAdService : AccessibilityService() {
         /** 文本类匹配只认比这更窄的控件（跳过按钮都是小标签）。 */
         const val NARROW_RATIO = 0.45f
 
-        /** 二次验证时允许的像素漂移：超过就认为页面已经变了，不点。 */
-        const val BOUNDS_DRIFT_PX = 16
+        /** 二次验证与点击判重共用的像素漂移上限：超过就认为页面已经变了，不点。 */
+        const val BOUNDS_DRIFT_PX = ClickTarget.DRIFT_PX
 
         /** 去掉数字后比较，倒计时文本才认得出是同一个按钮。 */
         val NUM = Regex("[0-9\\s]")

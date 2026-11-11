@@ -112,8 +112,8 @@
     },
     {
       "id": "window_changed_resets",
-      "desc": "窗口变化后冷却重置，可以重新判断",
-      "facts": { "text": "跳过广告", "freshWindow": true, "cooldownActive": true, "explicitText": true },
+      "desc": "窗口变化时服务已清 cooldownUntil，可以重新判断",
+      "facts": { "text": "跳过广告", "freshWindow": true, "cooldownActive": false, "explicitText": true },
       "expectAction": "CLICK", "expectLevel": "HIGH"
     },
     {

@@ -221,6 +221,14 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
         }
     }
 
+    // 操作结果提示别一直挂在页面顶部；切页时外层 key(section) 会重建组合清掉。
+    LaunchedEffect(message) {
+        if (message.isNotBlank()) {
+            delay(8000L)
+            message = ""
+        }
+    }
+
     if (dialogKind >= 0) {
         val title = when (dialogKind) {
             0 -> "添加拦截域名"
@@ -247,12 +255,14 @@ fun DetailScreen(section: String, onBack: () -> Unit, onCheckUpdate: () -> Unit)
                     val v = input.trim()
                     if (v.isNotEmpty()) {
                         if (dialogKind == 2) {
-                            if (v.startsWith("http://") || v.startsWith("https://")) {
+                            // Manifest 已禁用明文流量，http:// 一定拉不到内容；
+                            // 界面不该先收下再让用户在「更新完成：0 条」里猜原因。
+                            if (v.startsWith("https://")) {
                                 subs = (subs + v).distinct().sorted()
                                 prefs.subscriptions = subs.toSet()
                                 message = "订阅地址已添加，点「立即更新」生效"
                             } else {
-                                message = "订阅地址需要以 http:// 或 https:// 开头"
+                                message = "本应用禁用明文 HTTP，订阅地址需要以 https:// 开头"
                             }
                         } else {
                             val d = normalizeDomain(v)
@@ -1513,8 +1523,13 @@ private fun isAccessibilityEnabled(ctx: Context): Boolean {
     }
 }
 
-/** 跳过广告的真实状态：应用内开关、系统授权、服务连接三层分开看。 */
-internal enum class SkipAdStatus { OFF, NEED_PERMISSION, NOT_CONNECTED, RUNNING }
+/**
+ * 跳过广告的真实状态：应用内开关、系统授权、服务连接、是否只观察四层分开看。
+ *
+ * OBSERVING 必须单独成态：安全观察模式下服务一切正常，旧实现仍显示「正在工作」，
+ * 用户会以为「开着就该跳过广告」，而实际上一个点击都不会发生。
+ */
+internal enum class SkipAdStatus { OFF, NEED_PERMISSION, NOT_CONNECTED, OBSERVING, RUNNING }
 
 internal data class SkipAdSnapshot(val status: SkipAdStatus, val lastEventAt: Long)
 
@@ -1523,6 +1538,7 @@ private fun readSkipAdStatus(ctx: Context, enabled: Boolean): SkipAdSnapshot = S
         !enabled -> SkipAdStatus.OFF
         !isAccessibilityEnabled(ctx) -> SkipAdStatus.NEED_PERMISSION
         !SkipAdState.connected -> SkipAdStatus.NOT_CONNECTED
+        AppPrefs(ctx).observeMode -> SkipAdStatus.OBSERVING
         else -> SkipAdStatus.RUNNING
     },
     lastEventAt = SkipAdState.lastEventAt,
@@ -1532,6 +1548,7 @@ internal fun SkipAdStatus.shortLabel(): String = when (this) {
     SkipAdStatus.OFF -> "未开启"
     SkipAdStatus.NEED_PERMISSION -> "待授权"
     SkipAdStatus.NOT_CONNECTED -> "未生效"
+    SkipAdStatus.OBSERVING -> "只观察"
     SkipAdStatus.RUNNING -> "已开启"
 }
 
@@ -1539,6 +1556,7 @@ internal fun SkipAdStatus.title(): String = when (this) {
     SkipAdStatus.OFF -> "跳过广告未开启"
     SkipAdStatus.NEED_PERMISSION -> "未开启 · 需要授权"
     SkipAdStatus.NOT_CONNECTED -> "已授权，但服务没连上"
+    SkipAdStatus.OBSERVING -> "已开启 · 只观察，不点击"
     SkipAdStatus.RUNNING -> "已开启 · 正在工作"
 }
 
@@ -1622,6 +1640,15 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     var showSensorHelp by remember { mutableStateOf(false) }
     var skipCount by remember { mutableIntStateOf(prefs.skipToday) }
     var shakeCount by remember { mutableIntStateOf(prefs.shakeToday) }
+    // 计数由无障碍服务在后台写入；页面停留时也要跟着涨，
+    // 否则「已跳过广告」和同页会自动刷新的状态卡自相矛盾。
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(2000L)
+            skipCount = prefs.skipToday
+            shakeCount = prefs.shakeToday
+        }
+    }
     // 安全观察模式：只识别不点击，是规则上线前的确认环节
     var observe by remember { mutableStateOf(prefs.observeMode) }
     // 唯一状态源：页面可见时自动刷新，避免授权回来后还显示旧结论
@@ -1783,12 +1810,12 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
             confirmButton = {
                 TextButton(onClick = {
                     val v = input.trim()
-                    if (v.startsWith("http://") || v.startsWith("https://")) {
+                    if (v.startsWith("https://")) {
                         subs = (subs + v).distinct().sorted()
                         prefs.skipSubs = subs.toSet()
                         message = "订阅地址已添加，点「立即更新」生效"
                     } else {
-                        message = "订阅地址需要以 http:// 或 https:// 开头"
+                        message = "本应用禁用明文 HTTP，订阅地址需要以 https:// 开头"
                     }
                     input = ""
                     showAdd = false
@@ -2035,6 +2062,8 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                 Note("系统设置里没有开启「Time Leak 跳过广告」。点下面按钮，在「已安装的服务」里找到它并打开。")
             SkipAdStatus.NOT_CONNECTED ->
                 Note("系统显示已授权，但本应用的无障碍服务没有真正连上。小米 / 澎湃常见于省电策略把服务冻住：去系统设置把这个开关关掉再开一次，并把省电策略设为「无限制」。")
+            SkipAdStatus.OBSERVING ->
+                Note("服务已连上，但「只识别规则，不执行点击」开着：跳过按钮会被识别并逐条记录，不会自动点、也不会按返回键。关掉下面的安全观察开关即恢复自动跳过。")
             SkipAdStatus.RUNNING -> {
                 Note("无障碍服务已连上，开屏广告与摇一摇跳转都在本机处理，不上传任何界面内容。")
                 Spacer(Modifier.height(4.dp))
@@ -2047,7 +2076,11 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                 )
             }
         }
-        if (skipStatus.status != SkipAdStatus.RUNNING) {
+        // 只观察不是授权故障，不该把用户送去系统设置重开服务。
+        if (skipStatus.status == SkipAdStatus.OFF ||
+            skipStatus.status == SkipAdStatus.NEED_PERMISSION ||
+            skipStatus.status == SkipAdStatus.NOT_CONNECTED
+        ) {
             Spacer(Modifier.height(12.dp))
             ActionButton(
                 if (skipStatus.status == SkipAdStatus.NOT_CONNECTED) {
@@ -2104,7 +2137,10 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                 "清零",
                 fontSize = 12.sp,
                 color = ui.sub,
-                modifier = Modifier.clickable {
+                modifier = Modifier.clickable(
+                    role = Role.Button,
+                    onClickLabel = "清零今日统计",
+                ) {
                     prefs.resetSkipStats()
                     skipCount = 0
                     shakeCount = 0
@@ -2134,8 +2170,10 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
             onChange = { want ->
                 enabled = want
                 prefs.skipAdEnabled = want
-                // 已授权但服务没连上（假绑定）也要引导去设置重开，不能只看系统开关
-                if (want && readSkipAdStatus(ctx, want).status != SkipAdStatus.RUNNING) {
+                // 已授权但服务没连上（假绑定）也要引导去设置重开，不能只看系统开关；
+                // 只观察模式属于正常状态，不该误报成「没生效」。
+                val st = readSkipAdStatus(ctx, want).status
+                if (want && st != SkipAdStatus.RUNNING && st != SkipAdStatus.OBSERVING) {
                     message = if (openAccessibilitySettings(ctx)) {
                         "请在「已安装的服务」里找到 Time Leak 跳过广告并开启"
                     } else {

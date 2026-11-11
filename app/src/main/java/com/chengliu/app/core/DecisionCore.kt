@@ -116,7 +116,10 @@ object DecisionCore {
         }
 
         // 冷却：点击成功后同窗口内不再点；窗口变化会由服务把 cooldownActive 清掉。
-        val cooldownBlocked = f.cooldownActive && !f.freshWindow
+        // freshWindow 在整个开屏轮询期恒为 true（handleWindow 只在换窗口时调），
+        // 旧写法把 2 秒冷却在真正需要它的开屏会话里整个抵消了。
+        // 服务在 fresh 时已清过 cooldownUntil，决策层无需再用 freshWindow 放行。
+        val cooldownBlocked = f.cooldownActive
         if (cooldownBlocked) reasons.add("冷却期内（${Weights.COOLDOWN_MS / 1000} 秒），同窗口不重复点击")
 
         // 观察模式：只识别、只记录，永不点击。

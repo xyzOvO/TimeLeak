@@ -86,6 +86,15 @@ class LocalVpnService : VpnService() {
     private var running = false
     private var reader: Thread? = null
 
+    /**
+     * 隧道代次。ACTION_RESTART 会 stopTunnel() → startTunnel()，把 running 由 false
+     * 立刻置回 true；旧 reader 只判断 running 就退不干净：它会卡在已关闭 fd 的
+     * poll 报错循环里空转，或在新隧道正常时误报「读取线程已退出」。
+     * 每代 reader 只认自己的 generation。
+     */
+    @Volatile
+    private var generation = 0L
+
     // 每个查询都会阻塞在一次上游 socket 收发上。旧实现用无界 CachedThreadPool，
     // 遇到单域名重试风暴（如友盟 430/s）会瞬间 spawn 上千线程 → 线程爆炸 → GC 抖动 → 耗电。
     // 改成有界线程池：核心 4、最大 32、排队 256，队列满时直接丢弃该包（客户端超时重试），
@@ -118,6 +127,13 @@ class LocalVpnService : VpnService() {
 
     /** 上一次生效的接管集合签名；私人 DNS 地址变化时用来判断是否真的需要重建隧道 */
     private var lastCaptureKey = ""
+
+    /** 私人 DNS 解析结果缓存：键 = 主机名 + 底层网络标识，换网必定重解析。 */
+    private var lastDnsKey: String? = null
+    private var lastDnsIps: List<String>? = null
+
+    /** 底层网络标识；链路回调更新它，让上面这份缓存失效。 */
+    private var lastDnsNet = ""
 
     /** 区分「用户主动关」与「服务被系统弄死」，后者才允许有限恢复。 */
     private var userStopped = false
@@ -173,6 +189,9 @@ class LocalVpnService : VpnService() {
     override fun onDestroy() {
         unregisterLinkCallback()
         stopTunnel()
+        // 规则加载是后台线程做完再 post 回主线程的；服务销毁后这些回调不该再
+        // 重建 handler / capture / lastCaptureKey（还会在主线程 join 2 秒）。
+        mainHandler.removeCallbacksAndMessages(null)
         // 服务异常退出（省电策略 / 系统回收）时的有限恢复。
         // 只有用户打开了「开机 / 异常自动恢复」才会尝试，且要过恢复预算。
         if (!userStopped && AppPrefs(this).bootRestore) {
@@ -244,9 +263,10 @@ class LocalVpnService : VpnService() {
         // 隧道重建后网络栈可能已经换了，旧的引导解析器要作废
         bootstrapResolver = null
         cacheUpstream = null
+        val myGen = ++generation
         running = true
         VpnState.setRunning(true)
-        reader = Thread({ readLoop(pfd) }, "chengliu-dns").also { it.start() }
+        reader = Thread({ readLoop(pfd, myGen) }, "chengliu-dns").also { it.start() }
     }
 
     /** 只接受归一化后的 CIDR；v4 与 v6 都按 addRoute(addr, prefix) 加。 */
@@ -261,7 +281,7 @@ class LocalVpnService : VpnService() {
         }
     }
 
-    private fun readLoop(pfd: ParcelFileDescriptor) {
+    private fun readLoop(pfd: ParcelFileDescriptor, myGen: Long) {
         val input = FileInputStream(pfd.fileDescriptor)
         val output = FileOutputStream(pfd.fileDescriptor)
         val buf = ByteArray(2048)
@@ -275,7 +295,7 @@ class LocalVpnService : VpnService() {
         val pollFds = arrayOf(pollFd)
         var seen = 0
         var emptyReads = 0
-        while (running) {
+        while (running && generation == myGen) {
             val ready = try {
                 Os.poll(pollFds, 1000)
             } catch (e: ErrnoException) {
@@ -283,7 +303,7 @@ class LocalVpnService : VpnService() {
             }
             if (ready < 0) {
                 // fd 已失效（隧道被回收）时 poll 会报错，退避后重试，不要原地打转
-                if (!running) break
+                if (!running || generation != myGen) break
                 try {
                     Thread.sleep(200)
                 } catch (_: InterruptedException) {
@@ -299,7 +319,7 @@ class LocalVpnService : VpnService() {
             }
             if (n < 0) {
                 // EOF：连接的隧道已经没了。这里绝不 continue，否则就是死循环。
-                if (running) {
+                if (running && generation == myGen) {
                     Log.w(TAG, "DNS 读取线程收到 EOF，隧道已失效")
                     VpnState.setError("DNS 读取线程已退出，请重新开启本地过滤")
                 }
@@ -500,7 +520,8 @@ class LocalVpnService : VpnService() {
 
             // 系统私人 DNS 指定了服务器时，它的地址必须放行，否则 DoT 被隧道吞掉等于整机断解析。
             // 任意主机名（含不在内置表里的）都要解析成真实 IP 才能排除，所以走带网络解析的版本。
-            val pdnsIps = resolvePrivateDns(PrivateDns.read(this))
+            val pdns = PrivateDns.read(this)
+            val pdnsIps = privateDnsIps(pdns)
             val (routes, dropped) = CapturePlan.resolve(prefs.leakTargetIps, pdnsIps)
             capture = routes
             lastCaptureKey = routes.entries.joinToString(",")
@@ -576,6 +597,28 @@ class LocalVpnService : VpnService() {
         return out.toList()
     }
 
+    /**
+     * 同一「主机名 + 底层网络」只解析一次，网络回调很密，不该每次都起一条 2 秒线程。
+     *
+     * 两次边界必须守住：
+     *  - 解析超时 / 失败返回空集合时**不写缓存**，否则「开机那一下还没网」会把空的
+     *    排除集合一直沿用下去，DoT 被隧道吞掉等于整机断解析；
+     *  - 主机名没变但换网（Network 变了，DoT 服务器的 IP 可能跟着变）也要重解析。
+     */
+    private fun privateDnsIps(pdns: PrivateDns.State): List<String> {
+        val key = pdns.specifier + "|" + lastDnsNet
+        lastDnsIps?.let { if (lastDnsKey == key) return it }
+        val fresh = resolvePrivateDns(pdns)
+        if (fresh.isEmpty()) {
+            lastDnsKey = null
+            lastDnsIps = null
+        } else {
+            lastDnsKey = key
+            lastDnsIps = fresh
+        }
+        return fresh
+    }
+
     /** 监听底层网络（非 VPN）的链路变化；系统私人 DNS 校验完成时这里会收到回调。 */
     private fun registerLinkCallback() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
@@ -585,10 +628,14 @@ class LocalVpnService : VpnService() {
             .build()
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                // 两个回调都只认 Network 标识，格式必须一致，否则同一网络的
+                // 两次回调会来回改缓存键，等于每次都重解析一次。
+                lastDnsNet = network.toString()
                 maybeRestartForPrivateDns()
             }
 
             override fun onAvailable(network: Network) {
+                lastDnsNet = network.toString()
                 maybeRestartForPrivateDns()
             }
         }
@@ -616,7 +663,10 @@ class LocalVpnService : VpnService() {
      * 避免 WiFi 抖动点一下就断一次网。
      */
     private fun maybeRestartForPrivateDns() {
-        val pdnsIps = resolvePrivateDns(PrivateDns.read(this))
+        // 一次换网会连着来好几个 onAvailable / onLinkPropertiesChanged，
+        // 解析结果由 privateDnsIps 按「主机名 + 底层网络」缓存，这里只比较路由集合。
+        val pdns = PrivateDns.read(this)
+        val pdnsIps = privateDnsIps(pdns)
         val (routes, _) = CapturePlan.resolve(prefs.leakTargetIps, pdnsIps)
         val key = routes.entries.joinToString(",")
         if (key == lastCaptureKey) return
@@ -644,6 +694,7 @@ class LocalVpnService : VpnService() {
     }
 
     private fun stopTunnel() {
+        generation++
         running = false
         VpnState.setRunning(false)
         try {

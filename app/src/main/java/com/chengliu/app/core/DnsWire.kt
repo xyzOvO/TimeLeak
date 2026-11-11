@@ -28,6 +28,12 @@ object DnsWire {
         if (u16(msg, 4) != 1) return null
         val (name, nameEnd) = decodeName(msg, HEADER, length) ?: return null
         if (nameEnd + 4 > length) return null
+        // question 段里用压缩指针时，nxDomain / servfail 只拷到「指针 + 4」，
+        // 指针指向的标签会被截掉，客户端拿到越界应答只能超时重试。
+        // 这种报文交给上游原样转发，不本地构造应答。
+        for (i in HEADER until nameEnd) {
+            if ((msg[i].toInt() and 0xC0) == 0xC0) return null
+        }
         return Query(name, u16(msg, nameEnd), u16(msg, nameEnd + 2), nameEnd + 4)
     }
 

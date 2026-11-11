@@ -26,6 +26,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -202,16 +203,20 @@ fun AppRulesPage() {
             } else if (shown.isEmpty()) {
                 ExNote("没有匹配的应用。列表只包含有桌面入口的应用；系统组件不在这里出现。")
             } else {
+                // key 让「再显示 20 个」或搜索筛选时 Compose 能按包名复用行，
+                // 不必把已显示的每一行都整体重组一遍。
                 shown.forEach { app ->
-                    AppRuleRow(
-                        label = app.label,
-                        pkg = app.pkg,
-                        status = modeText(ctx, app.pkg, skipOff, protected),
-                        on = !skipOff.contains(app.pkg) && !protected.contains(app.pkg),
-                        locked = protected.contains(app.pkg),
-                        onToggle = { setSkip(app.pkg, it) },
-                        onClick = { editPkg = app.pkg },
-                    )
+                    key(app.pkg) {
+                        AppRuleRow(
+                            label = app.label,
+                            pkg = app.pkg,
+                            status = modeText(ctx, app.pkg, skipOff, protected),
+                            on = !skipOff.contains(app.pkg) && !protected.contains(app.pkg),
+                            locked = protected.contains(app.pkg),
+                            onToggle = { setSkip(app.pkg, it) },
+                            onClick = { editPkg = app.pkg },
+                        )
+                    }
                 }
                 if (filtered.size > shown.size) {
                     Spacer(Modifier.height(8.dp))

@@ -21,7 +21,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import kotlinx.coroutines.delay
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -50,7 +53,14 @@ fun HomeScreen(
 ) {
     val ui = LocalUi.current
     val ctx = LocalContext.current
-    val privateDns = remember { privateDnsMode(ctx) }
+    // 系统「私人 DNS」模式随时会在设置里被改掉，进页面取一次会一直留着旧结论
+    // （改回自动后警告不消失、或改成严格后不出现）。按页面的刷新节奏重读。
+    val privateDns by produceState(initialValue = privateDnsMode(ctx)) {
+        while (true) {
+            delay(2000L)
+            value = privateDnsMode(ctx)
+        }
+    }
     val latest = recent.maxByOrNull { it.lastAt }
 
     Column(

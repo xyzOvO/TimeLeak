@@ -64,6 +64,13 @@
                 android:resource="@xml/accessibility_service_config" />
         </service>
 
+        <!-- 跳过广告的独立前台保活：与 VPN 总开关无关，只把进程留在前台优先级，
+             防止省电策略回收进程后无障碍绑定掉线。通知渠道可被用户单独隐藏。 -->
+        <service
+            android:name=".core.SkipGuardService"
+            android:exported="false"
+            android:label="跳过广告保活" />
+
         <!-- 开机恢复：只重启本机 DNS 前台服务，且受恢复预算约束 -->
         <receiver
             android:name=".core.BootReceiver"

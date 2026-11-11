@@ -41,12 +41,10 @@ object FloodGuard {
      */
     fun admit(name: String): Boolean {
         val now = System.currentTimeMillis()
-        val e = map[name]
-        if (e == null) {
-            if (map.size > MAX_ENTRIES) sweep(now)
-            map[name] = Entry(now, 1, 0L)
-            return true
-        }
+        if (map.size > MAX_ENTRIES) sweep(now)
+        // 必须用 computeIfAbsent：洪流恰恰发生在「多个线程同时第一次见到这个域名」时，
+        // 先 get 再 put 会互相覆盖 Entry，计数从 1 重来，熔断迟迟不触发。
+        val e = map.computeIfAbsent(name) { Entry(now, 0, 0L) }
         synchronized(e) {
             if (e.throttledUntil > now) return false
             if (now - e.windowStart >= WINDOW_MS) {

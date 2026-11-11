@@ -240,8 +240,10 @@ object SkipEngine {
             }
             if (windowAgeMs > limit) continue
             for (r in g.rules) {
-                if (r.activityIds.isNotEmpty() && act.isNotEmpty() &&
-                    r.activityIds.none { it.equals(act, true) }
+                // 拿不到 Activity（服务在 App 已前台后才连上）时按「宁可漏点」处理：
+                // 不能因为 act 为空就把 activityIds 限定整条跳过，那等于对所有页面放行。
+                if (r.activityIds.isNotEmpty() &&
+                    (act.isEmpty() || r.activityIds.none { it.equals(act, true) })
                 ) continue
                 if (r.excludes.any { it.hit(text, desc, id, cls) }) continue
                 if (r.specs.any { it.hit(text, desc, id, cls) }) return r.action
@@ -388,7 +390,6 @@ object SkipEngine {
         text: String,
         desc: String,
         id: String,
-        cls: String,
         bounds: Rect,
         screenW: Int,
         screenH: Int,
@@ -477,7 +478,12 @@ object SkipEngine {
             if (rm["enable"] == false) continue
             b.ruleRaw++
             val excludes = ArrayList<Spec>()
-            for (s in strings(rm["excludeMatches"])) gkdSpecs(s, excludes)
+            // excludeMatches 是「命中就不点」的正向选择器，返回的 Spec 必须进排除表。
+            // 里面若写了取反条件属于双重否定、语义混乱，按「宁可漏点」丢掉，
+            // 所以给它一个临时列表接住副作用，不混进本规则的 excludes。
+            for (s in strings(rm["excludeMatches"])) {
+                excludes.addAll(gkdSpecs(s, mutableListOf()))
+            }
             val specs = ArrayList<Spec>()
             for (s in strings(rm["matches"])) specs.addAll(gkdSpecs(s, excludes))
             if (specs.isEmpty()) continue
@@ -506,7 +512,21 @@ object SkipEngine {
      */
     private fun gkdSpecs(selector: String, excludes: MutableList<Spec>): List<Spec> {
         val out = ArrayList<Spec>()
-        for (part in splitTop(selector, "||")) {
+        for (m in NEG_CONTAINS.findAll(selector)) {
+            val attr = m.groupValues[1].lowercase()
+            val value = m.groupValues[2].ifEmpty { m.groupValues[3] }.trim()
+            if (value.isEmpty()) continue
+            val target = when (attr) {
+                "text" -> Target.TEXT
+                "desc" -> Target.DESC
+                "vid", "id" -> Target.ID
+                "name" -> Target.CLASS
+                else -> continue
+            }
+            excludes.add(Spec(listOf(listOf(Clause(target, Op.CONTAINS, value)))))
+        }
+        val cleaned = NEG_CONTAINS.replace(selector, "")
+        for (part in splitTop(cleaned, "||")) {
             val byId = ArrayList<Clause>()
             val byText = ArrayList<Clause>()
             val byDesc = ArrayList<Clause>()
@@ -524,8 +544,9 @@ object SkipEngine {
                     else -> continue
                 }
                 if (opRaw == "!=") {
-                    // != 是排除条件，和「命中条件」不是一回事
-                    excludes.add(Spec(listOf(listOf(Clause(target, Op.CONTAINS, value)))))
+                    // != 是「不等于」：作为排除条件应当是「恰好等于就排除」，
+                    // 用 CONTAINS 会把一堆本该保留的控件也排除掉。
+                    excludes.add(Spec(listOf(listOf(Clause(target, Op.EQ, value)))))
                     continue
                 }
                 val op = when (opRaw) {
@@ -659,6 +680,16 @@ object SkipEngine {
 
     private val PRED = Regex(
         """(text|desc|name|vid|id)\s*(!=|\*=|\^=|${'$'}=|~=|=)\s*(?:"([^"]*)"|'([^']*)')""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    /**
+     * GKD 的取反包含操作符（`vid!*="download"`、`text!*="跳过登录"`）。
+     * PRED 的 op 组不认 `!*=`，整条条件会被静默丢掉 —— 偏偏这是最不该丢的
+     * 排除条件。单独抽出来加进 excludes，再从选择器里抹掉交给 PRED。
+     */
+    private val NEG_CONTAINS = Regex(
+        """(text|desc|name|vid|id)\s*!\*=\s*(?:"([^"]*)"|'([^']*)')""",
         RegexOption.IGNORE_CASE,
     )
 

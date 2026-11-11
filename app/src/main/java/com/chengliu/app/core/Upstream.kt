@@ -192,9 +192,12 @@ class DohResolver(
                 } catch (_: Exception) {
                 }
             }
+            // protect 失败时这个 socket 会被自己的隧道路由吞掉，继续 connect 只会
+            // 等到超时再静默返回 null；直接放弃，让调用方尽快换下一个 IP。
             try {
-                protectSocket?.invoke(raw)
+                if (protectSocket?.invoke(raw) == false) return null
             } catch (_: Exception) {
+                return null
             }
             raw.connect(InetSocketAddress(ip, target.port), CONNECT_TIMEOUT)
             raw.soTimeout = READ_TIMEOUT

@@ -6,9 +6,10 @@ import org.json.JSONObject
 
 /** 全部配置集中在一个 SharedPreferences 文件里，不建数据库、不落查询日志。 */
 class AppPrefs(ctx: Context) {
+    private val appCtx: Context = ctx.applicationContext
     private val sp: SharedPreferences =
-        ctx.applicationContext.getSharedPreferences("chengliu_prefs", Context.MODE_PRIVATE)
-    private val selfPkg: String = ctx.applicationContext.packageName
+        appCtx.getSharedPreferences("chengliu_prefs", Context.MODE_PRIVATE)
+    private val selfPkg: String = appCtx.packageName
 
     var builtinEnabled: Boolean
         get() = sp.getBoolean(KEY_BUILTIN, true)
@@ -118,7 +119,12 @@ class AppPrefs(ctx: Context) {
     /** 是否启用自动跳过开屏广告（无障碍服务授权 + 此项同时为 true 才工作）。 */
     var skipAdEnabled: Boolean
         get() = sp.getBoolean("skip_ad_enabled", false)
-        set(v) = sp.edit().putBoolean("skip_ad_enabled", v).apply()
+        set(v) {
+            sp.edit().putBoolean("skip_ad_enabled", v).apply()
+            // 开关同时驱动前台保活：VPN 总开关关着时进程也要留在前台，
+            // 否则省电策略一回收进程，系统侧的无障碍绑定就会掉线。
+            if (v) SkipGuardService.ensure(appCtx) else SkipGuardService.stop(appCtx)
+        }
 
     /** 内置通用跳过词是否参与匹配（跨应用兜底）。 */
     var skipBuiltin: Boolean

@@ -32,8 +32,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -42,6 +44,7 @@ import androidx.compose.ui.unit.sp
 import com.chengliu.app.core.AppPrefs
 import com.chengliu.app.core.BlockLog
 import com.chengliu.app.core.LocalVpnService
+import com.chengliu.app.core.SkipGuardService
 import com.chengliu.app.core.Counters
 import com.chengliu.app.core.VpnState
 import com.chengliu.app.ui.AppDrawerContent
@@ -72,6 +75,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         Counters.init(this)
         RunStats.init(this)
+        // 进程被回收后用户重新打开 App，也要把跳过广告的前台保活补回来。
+        SkipGuardService.ensure(this)
         // 服务没启动时也要能显示规则来源（打开拦截记录页即是最新的一批规则）
         SourceInfo.refresh(this, AppPrefs(this))
 
@@ -130,7 +135,9 @@ private fun AppRoot(
 ) {
     val ui = LocalUi.current
     val context = LocalContext.current
-    var page by remember { mutableStateOf("home") }
+    // rememberSaveable：切系统深色模式 / 改字体导致 Activity 重建时，
+    // 用户不该被从「拦截记录」这类深层页面直接踢回首页。
+    var page by rememberSaveable { mutableStateOf("home") }
     var showTheme by remember { mutableStateOf(false) }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
@@ -289,7 +296,11 @@ private fun AppRoot(
                 onOpenMenu = { scope.launch { drawerState.open() } },
                 onOpen = { page = it },
             )
-            else -> DetailScreen(section = page, onBack = { page = "home" }, onCheckUpdate = { checkUpdate() })
+            // key 让切页时整棵 DetailScreen 组合重建：顶层几十个 prefs 快照、
+            // 弹窗输入与提示条都不会从上一页残留到这一页。
+            else -> key(page) {
+                DetailScreen(section = page, onBack = { page = "home" }, onCheckUpdate = { checkUpdate() })
+            }
         }
     }
 

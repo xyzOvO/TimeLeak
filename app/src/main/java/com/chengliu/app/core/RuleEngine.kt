@@ -124,17 +124,20 @@ data class ParsedRules(val blocked: List<String>, val allowed: List<String>)
  * 三份名单分开存，是为了让界面能说清「这条是内置规则拦的，还是你导进来的订阅拦的」。
  */
 class RuleEngine {
-    @Volatile
-    private var builtin: Set<String> = emptySet()
+    /**
+     * 四份名单装进一个不可变快照。之前是 4 个独立 @Volatile 字段逐个赋值，
+     * 切档 / 刷订阅的瞬间判定线程会读到「新黑名单 + 旧白名单」的混合状态，
+     * 把本该放行的系统连通性探测域名误拦成 NXDOMAIN。
+     */
+    private data class Rules(
+        val builtin: Set<String>,
+        val custom: Set<String>,
+        val subscription: Set<String>,
+        val allowed: Set<String>,
+    )
 
     @Volatile
-    private var custom: Set<String> = emptySet()
-
-    @Volatile
-    private var subscription: Set<String> = emptySet()
-
-    @Volatile
-    private var allowed: Set<String> = emptySet()
+    private var snapshot = Rules(emptySet(), emptySet(), emptySet(), emptySet())
 
     fun replace(
         builtinDomains: Collection<String>,
@@ -142,20 +145,23 @@ class RuleEngine {
         subscriptionDomains: Collection<String>,
         allowlist: Collection<String>,
     ) {
-        builtin = builtinDomains.mapNotNull { normalizeDomain(it) }.toHashSet()
-        custom = customDomains.mapNotNull { normalizeDomain(it) }.toHashSet()
-        subscription = subscriptionDomains.mapNotNull { normalizeDomain(it) }.toHashSet()
-        allowed = allowlist.mapNotNull { normalizeDomain(it) }.toHashSet()
+        snapshot = Rules(
+            builtinDomains.mapNotNull { normalizeDomain(it) }.toHashSet(),
+            customDomains.mapNotNull { normalizeDomain(it) }.toHashSet(),
+            subscriptionDomains.mapNotNull { normalizeDomain(it) }.toHashSet(),
+            allowlist.mapNotNull { normalizeDomain(it) }.toHashSet(),
+        )
     }
 
     fun decide(name: String): Verdict? {
+        val s = snapshot
         val d = normalizeDomain(name) ?: return null
         var cursor: String? = d
         while (cursor != null) {
-            if (allowed.contains(cursor)) return null
-            if (builtin.contains(cursor)) return Verdict(cursor, RuleSource.BUILTIN)
-            if (custom.contains(cursor)) return Verdict(cursor, RuleSource.CUSTOM)
-            if (subscription.contains(cursor)) return Verdict(cursor, RuleSource.SUBSCRIPTION)
+            if (s.allowed.contains(cursor)) return null
+            if (s.builtin.contains(cursor)) return Verdict(cursor, RuleSource.BUILTIN)
+            if (s.custom.contains(cursor)) return Verdict(cursor, RuleSource.CUSTOM)
+            if (s.subscription.contains(cursor)) return Verdict(cursor, RuleSource.SUBSCRIPTION)
             val dot = cursor.indexOf('.')
             if (dot < 0) break
             val next = cursor.substring(dot + 1)
@@ -174,10 +180,11 @@ class RuleEngine {
      * 否则数字会等于 DNS 查询总数，毫无信息量。
      */
     fun isAllowed(name: String): Boolean {
+        val s = snapshot
         val d = normalizeDomain(name) ?: return false
         var cursor: String? = d
         while (cursor != null) {
-            if (allowed.contains(cursor)) return true
+            if (s.allowed.contains(cursor)) return true
             val dot = cursor.indexOf('.')
             if (dot < 0) break
             val next = cursor.substring(dot + 1)
@@ -187,5 +194,5 @@ class RuleEngine {
         return false
     }
 
-    fun count(): Int = builtin.size + custom.size + subscription.size
+    fun count(): Int = snapshot.let { it.builtin.size + it.custom.size + it.subscription.size }
 }

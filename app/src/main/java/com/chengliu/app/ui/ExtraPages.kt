@@ -37,6 +37,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -120,7 +121,7 @@ internal fun ExButton(text: String, onClick: () -> Unit, modifier: Modifier = Mo
             .height(42.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(ui.bg)
-            .clickable { onClick() },
+            .clickable(role = Role.Button, onClickLabel = text) { onClick() },
         contentAlignment = Alignment.Center,
     ) {
         Text(text, fontSize = 13.sp, color = ui.accent, fontWeight = FontWeight.Medium)
@@ -346,10 +347,12 @@ fun HealthPage() {
                             .width(8.dp).height(8.dp)
                             .clip(RoundedCornerShape(4.dp))
                             .background(
+                                // 三态色阶要能一眼区分：绿 / 橙 / 红，且警告与错误
+                                // 都跟随主题，别混用固定调色板常量。
                                 when (item.state) {
                                     HealthState.OK -> ui.active
-                                    HealthState.WARN -> ui.warn
-                                    HealthState.ERROR -> IconRed
+                                    HealthState.WARN -> IconOrange
+                                    HealthState.ERROR -> ui.warn
                                 },
                             ),
                     )
@@ -729,7 +732,7 @@ fun PrivacyPage() {
                     confirmAll = false
                     refreshTick++
                     message = "全部本地数据已清空，配置已回到默认值"
-                }) { Text("确认清空", color = IconRed) }
+                }) { Text("确认清空", color = ui.warn) }
             },
             dismissButton = {
                 TextButton(onClick = { confirmAll = false }) { Text("取消", color = ui.sub) }
@@ -928,7 +931,7 @@ fun SubGuardPage() {
                 Modifier.fillMaxWidth())
             if (prefs.subError.isNotBlank()) {
                 Spacer(Modifier.height(8.dp))
-                ExNote("最近一次失败原因：${prefs.subError}", IconRed)
+                ExNote("最近一次失败原因：${prefs.subError}", ui.warn)
             }
         }
         Spacer(Modifier.height(12.dp))
@@ -955,7 +958,7 @@ fun SubGuardPage() {
                     ExNote("异常检查：通过", ui.active)
                 } else {
                     p.check.issues.forEach { i ->
-                        ExNote("${i.label}：${i.text}", if (i.blocking) IconRed else ui.warn)
+                        ExNote("${i.label}：${i.text}", if (i.blocking) ui.warn else ui.sub)
                     }
                 }
                 Spacer(Modifier.height(8.dp))

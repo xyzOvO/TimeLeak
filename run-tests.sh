@@ -42,6 +42,8 @@ TEST_CLASSES=(
   com.chengliu.app.core.Json5Test
   com.chengliu.app.core.FloodGuardTest
   com.chengliu.app.core.UpdateCheckerTest
+  com.chengliu.app.core.SkipEngineNegationTest
+  com.chengliu.app.core.ClickTargetTest
 )
 
 exec "$JAVA_HOME/bin/java" -cp "$CP" org.junit.runner.JUnitCore "${TEST_CLASSES[@]}"
