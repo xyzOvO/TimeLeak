@@ -395,6 +395,7 @@ object SkipEngine {
         screenH: Int,
         inSplash: Boolean,
         reason: HitReason,
+        roundCountdown: Boolean = false,
     ): AdKind {
         val s = (text.ifEmpty { desc }).trim().lowercase()
         val both = "$text $desc".trim().lowercase()
@@ -415,7 +416,9 @@ object SkipEngine {
             val strong = SkipSources.sdkHit(id) ||
                 SkipSources.sdkCloseHit(id) ||
                 builtinHit(text, desc, "") ||
-                SkipSources.explicitAdClose(text, desc, id) || corner
+                SkipSources.explicitAdClose(text, desc, id) || corner ||
+                // 开屏角落里只有数字的圆形倒计时，也是明确的跳过按钮。
+                roundCountdown
             if (strong || reason == HitReason.SUBSCRIPTION ||
                 reason == HitReason.TEXT_GUESS || reason == HitReason.COORDINATE
             ) return AdKind.SPLASH

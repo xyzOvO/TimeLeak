@@ -15,6 +15,7 @@ object BackupRestore {
     const val SCHEMA = 1
     private const val APP = "com.chengliu.app"
     private const val KIND_APP_RULES = "app-rules"
+    private const val KIND_AD_RULES = AdRulesCodec.KIND
 
     fun export(ctx: Context): String {
         val p = AppPrefs(ctx)
@@ -177,5 +178,63 @@ object BackupRestore {
         p.appSkipOff = readSet("skipOff")
         p.protectedApps = readSet("protected")
         return "已导入 ${m.size} 条策略、${p.appSkipOff.size} 个关闭项、${p.protectedApps.size} 个保护应用"
+    }
+
+    // ---------------- 只导出 / 导入广告规则 ----------------
+
+    /**
+     * 只搬「广告跳过规则」：自定义规则正文 + 订阅地址。
+     *
+     * 刻意不导出订阅正文缓存：那是从远端下载的第三方内容，体积可能上兆，
+     * 换机后点一次「立即更新」就能重新拉回来，没必要塞进分享文件里。
+     * 也不含应用策略、DNS 配置和任何记录。
+     */
+    fun exportAdRules(ctx: Context): String {
+        val p = AppPrefs(ctx)
+        val o = JSONObject()
+        o.put("schema", SCHEMA)
+        o.put("app", APP)
+        o.put("kind", KIND_AD_RULES)
+        o.put("at", System.currentTimeMillis())
+        o.put("customRules", p.customRules)
+        o.put("skipSubs", JSONArray(p.skipSubs.toList()))
+        return o.toString(2)
+    }
+
+    /**
+     * 导入广告规则：字段白名单，订阅地址只收 https://，规则正文限长。
+     * 未知字段一律忽略，不执行任何反射，也不合并进配置备份。
+     */
+    fun importAdRules(ctx: Context, text: String): String {
+        val o = runCatching { JSONObject(text) }
+            .getOrElse { throw IllegalArgumentException("不是合法的 JSON") }
+        // 只把 org.json 读出的原始值交给纯逻辑层校验，判断不留在桩方法这一侧。
+        val subsRaw = ArrayList<String>()
+        o.optJSONArray("skipSubs")?.let { a ->
+            for (i in 0 until minOf(a.length(), AdRulesCodec.MAX_SUBS * 4)) {
+                subsRaw.add(a.optString(i, ""))
+            }
+        }
+        val parsed = AdRulesCodec.parse(
+            AdRulesCodec.Raw(
+                text = text,
+                schema = o.optInt("schema", -1),
+                app = o.optString("app"),
+                kind = o.optString("kind"),
+                rules = o.optString("customRules", ""),
+                hasRules = o.has("customRules"),
+                subs = subsRaw,
+                hasSubs = o.has("skipSubs"),
+            ),
+        )
+        val p = AppPrefs(ctx)
+        // 导入是替换语义：字段存在才写，缺字段的保留用户当前值。
+        if (parsed.rulesPresent) p.customRules = parsed.rules
+        val subMsg = parsed.subs?.let {
+            p.skipSubs = it
+            "订阅源 ${it.size} 个"
+        } ?: "订阅源保持不变"
+        val ruleMsg = if (parsed.rulesPresent) "自定义规则 ${parsed.rules.length} 字" else "自定义规则保持不变"
+        return "已导入：$ruleMsg、$subMsg；订阅正文请点「立即更新」重新拉取"
     }
 }

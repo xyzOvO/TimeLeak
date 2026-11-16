@@ -8,6 +8,7 @@ import android.os.Handler
 import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.widget.Toast
 
 /**
  * 自动跳过开屏广告 / 弹窗 + 摇一摇落地页回退。
@@ -17,8 +18,8 @@ import android.view.accessibility.AccessibilityNodeInfo
  *  1. **不能只靠事件驱动**。开屏广告往往在启动过渡结束之后才渲染，而且不发
  *     任何无障碍事件，只监听 `TYPE_WINDOW_CONTENT_CHANGED` 会整场错过。
  *     所以进入新窗口后有一段时间的主动轮询（见 [pollTask]）。
- *  2. **启动过渡期间屏幕上是上一次会话的快照**，头几百毫秒点下去没有意义，
- *     轮询故意延后 [FIRST_POLL_DELAY_MS] 才开始。
+ *  2. **启动过渡期间屏幕上是上一次会话的快照**，换窗口那次 force 扫描本来
+ *     就拿不到按钮，所以主动轮询只需等 [FIRST_POLL_DELAY_MS] 让动画过去。
  *  3. **点完要复查**。命中后如果按钮还在，说明那一下没生效（常见于倒计时
  *     控件吞掉了点击），下一轮继续试，但同一个控件最多 [MAX_SAME_CLICKS] 次，
  *     避免在页面上反复戳同一个位置。
@@ -78,6 +79,7 @@ class SkipAdService : AccessibilityService() {
     private var eventCount = 0
     private var isPolling = false
 
+
     /** 本次服务实例在 [SkipAdState] 里的令牌，销毁时只清自己。 */
     private var stateToken = 0
 
@@ -111,6 +113,17 @@ class SkipAdService : AccessibilityService() {
     /** 安全观察模式缓存值，由 syncEngine() 跟随配置热更新。 */
     private var observe = false
 
+    /** 高级开关缓存：附加动作、圆形倒计时、手势兜底、跳过提示。每次事件同步一次。 */
+    private var extraTeen = false
+    private var extraWechat = false
+    private var gestureFallback = true
+    private var skipToast = true
+    private var toastText = ""
+    private var lastToastAt = 0L
+
+    /** 附加动作节流，避免每轮轮询都做一次全树扫描。 */
+    private var lastExtraAt = 0L
+
     /** 本次遍历的绝对截止时刻，超过就停，避免畸形界面把主线程拖住。 */
     private var scanDeadline = 0L
 
@@ -133,7 +146,7 @@ class SkipAdService : AccessibilityService() {
      */
     private val scanNodes = ArrayList<AccessibilityNodeInfo>(128)
 
-    /** 内容变化事件的短时合并：120ms 内的连续变化只扫一次。 */
+    /** 内容变化事件的短时合并：开屏窗之外的连续变化只扫一次。 */
     private var pendingScanPkg: String? = null
     // 用对象表达式 + this 重排自己：在 Runnable lambda 里直接引用同名 val
     // 会让编译器报「Variable must be initialized」。
@@ -185,7 +198,7 @@ class SkipAdService : AccessibilityService() {
         android.util.Log.i("SkipAd", "无障碍服务已连上")
         // 系统重新绑定成功时补一次保活，避免之后又被省电策略回收。
         SkipGuardService.ensure(this)
-        observe = prefs.observeMode
+        syncFlags()
         SkipEngine.builtin = prefs.skipBuiltin
         lastCache = prefs.skipSubCache
         lastCustom = prefs.customRules
@@ -248,11 +261,12 @@ class SkipAdService : AccessibilityService() {
                     handleWindow(pkg, "", now)
                     return
                 }
-                // 短时间合并：倒计时文本每秒变、列表滚动连发事件，
-                // 120ms 内的连续内容变化只做一次全树遍历。
+                // 开屏窗之外才做时间合并：倒计时文本每秒变、列表滚动连发事件，
+                // 120ms 内的连续变化只做一次全树遍历。开屏初期直接立即扫，
+                // 不再白等一整个合并窗口。
                 pendingScanPkg = pkg
                 handler.removeCallbacks(pendingScan)
-                // 开屏初期按钮刚渲染，把合并窗口压短，别白等一整轮。
+                // 开屏初期首个事件立即扫，不再白等一整个合并窗口。
                 val mergeMs = if (inFastWindow(now)) SCAN_MERGE_FAST_MS else SCAN_MERGE_MS
                 handler.postDelayed(pendingScan, mergeMs)
             }
@@ -336,7 +350,7 @@ class SkipAdService : AccessibilityService() {
         if (!prefs.skipAdEnabled) return
         handler.removeCallbacks(pollTask)
         isPolling = true
-        // 启动过渡里屏幕上是上一次会话的快照，先等它过去
+        // 过渡帧那次扫描已由 handleWindow 的 force 覆盖，这里只等动画过去
         handler.postDelayed(pollTask, FIRST_POLL_DELAY_MS)
     }
 
@@ -481,6 +495,8 @@ class SkipAdService : AccessibilityService() {
                 "扫描 $realPkg 节点=${refs.size} 开屏窗=${windowAge}ms 策略=${policy.mode} force=$force",
             )
             nodeCount = refs.size
+            // 附加动作（青少年弹窗 / 微信原图）默认全关，开关没开时一行退出、零开销。
+            if (scanExtra(refs, screen, now, realPkg)) return
             // 候选 = 有文案或 id、够窄、且不是业务按钮。这个数字是心跳里最有用的，
             // 它能直接回答「到底是没扫到，还是扫到了但没有一个算候选」。
             candidateCount = refs.count { r ->
@@ -624,9 +640,113 @@ class SkipAdService : AccessibilityService() {
             )
             val explicit = SkipEngine.builtinHit(r.text, r.desc, "") ||
                 SkipSources.explicitAdClose(r.text, r.desc, r.id) || corner
-            if (explicit && click(r, now, HitReason.EXPLICIT_TEXT)) return true
+            // 只有数字的圆形倒计时：几何 + 资源名双重确认，才算明确跳过按钮。
+            val roundHit = ExtraRules.roundEnabled && ExtraRules.isRoundCountdown(
+                ExtraRules.Node(
+                    r.text, r.desc, r.id,
+                    r.bounds.left, r.bounds.top, r.bounds.right, r.bounds.bottom,
+                    r.clickable,
+                ),
+                screen.width(), screen.height(),
+            )
+            if ((explicit || roundHit) && click(r, now, HitReason.EXPLICIT_TEXT, roundHit)) return true
         }
         return false
+    }
+
+    /**
+     * 附加动作：青少年模式弹窗 / 微信查看原图。默认全关。
+     *
+     * 这类目标不是广告，`classify()` 会把「我知道了」判成 UNKNOWN 硬否决，
+     * 所以不进广告判定链；但冷却、会话上限、用户空闲、二次验证、点击去重
+     * 全部复用既有实现，不新增裸点击路径。只有「今日已跳过广告」计数与
+     * 跳过提示语不复用 —— 那两项只统计真正的广告。
+     */
+    private fun scanExtra(refs: List<Ref>, screen: Rect, now: Long, realPkg: String): Boolean {
+        if (!extraTeen && !extraWechat) return false
+        if (observe) return false // 观察模式只识别不点击，附加动作同样不执行
+        if (now - lastExtraAt < EXTRA_SCAN_GAP_MS) return false
+        lastExtraAt = now
+        if (now < cooldownUntil || sessionClicks >= MAX_SESSION_CLICKS) return false
+        if (now - lastInteractAt < 900) return false
+        if (currentPolicy.mode == PolicyMode.DISABLED) return false
+        val nodes = refs.map {
+            ExtraRules.Node(
+                it.text, it.desc, it.id,
+                it.bounds.left, it.bounds.top, it.bounds.right, it.bounds.bottom,
+                it.clickable,
+            )
+        }
+        val hit = ExtraRules.match(
+            realPkg, nodes, screen.width(), screen.height(),
+            ExtraRules.Flags(teenPopup = extraTeen, wechatOriginal = extraWechat),
+        ) ?: return false
+        val ref = refs.getOrNull(hit.index) ?: return false
+        return extraClick(ref, now, hit)
+    }
+
+    /** 附加动作的唯一执行出口：二次验证 -> 控件点击 -> 可选手势兜底 -> 统一记账。 */
+    private fun extraClick(ref: Ref, now: Long, hit: ExtraRules.Hit): Boolean {
+        val base = "extra:${hit.kind.name}|" + ref.id + "|" + ref.text.replace(NUM, "")
+        val key = base + "|" + ref.bounds.left + "," + ref.bounds.top
+        if ((clickCounts[key] ?: 0) >= MAX_SAME_CLICKS) return false
+        if (now - lastClickAt < CLICK_GAP_MS) return false
+        val node = scanNodes.getOrNull(ref.nodeIndex) ?: return false
+        val fresh = Rect()
+        val denied = verifyBeforeClick(ref, node, fresh)
+        if (denied != null) {
+            android.util.Log.i("SkipAd", "附加动作未执行(${hit.kind.label}): $denied")
+            return false
+        }
+        var cur: AccessibilityNodeInfo? = node
+        var depth = 0
+        while (cur != null && depth <= 3) {
+            if (cur.isClickable && cur.isEnabled &&
+                cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            ) {
+                markExtra(key, base, ref, now, hit)
+                return true
+            }
+            val parent = cur.parent
+            if (parent != null) scanNodes.add(parent)
+            cur = parent
+            depth++
+        }
+        if (gestureFallback && now - lastGestureAt > 700 &&
+            fresh.width() > 20 && fresh.height() > 20
+        ) {
+            val path = Path().apply { moveTo(fresh.exactCenterX(), fresh.exactCenterY()) }
+            val gesture = GestureDescription.Builder()
+                .addStroke(GestureDescription.StrokeDescription(path, 0, 40))
+                .build()
+            lastGestureAt = now
+            if (dispatchGesture(gesture, null, null)) {
+                markExtra(key, base, ref, now, hit)
+                return true
+            }
+        }
+        return false
+    }
+
+    /**
+     * 借 mark() 统一写冷却 / 去重 / 会话点击上限，规则名标明是附加动作。
+     * `ad = false`：附加动作不是广告，不进「今日已跳过广告」，也不弹跳过提示。
+     */
+    private fun markExtra(key: String, base: String, ref: Ref, now: Long, hit: ExtraRules.Hit) {
+        mark(
+            key, base, ref.bounds.left, ref.bounds.top, now,
+            Decision(
+                score = Weights.HIGH_MIN,
+                level = Confidence.HIGH,
+                kind = AdKind.POPUP,
+                action = DecisionAction.CLICK,
+                rule = "extra:${hit.kind.name.lowercase()}",
+                reasons = listOf(hit.kind.label),
+                policyAllowed = true,
+            ),
+            ad = false,
+        )
+        android.util.Log.i("SkipAd", "附加动作已执行: ${hit.kind.label} ${hit.label}")
     }
 
     /**
@@ -717,7 +837,7 @@ class SkipAdService : AccessibilityService() {
      * 多条件评分 -> 广告类型 -> 应用策略 -> 冷却 -> 观察模式。
      * 观察模式下这里会完整识别并记录，但永远不执行任何点击 / 返回键。
      */
-    private fun click(ref: Ref, now: Long, reason: HitReason): Boolean {
+    private fun click(ref: Ref, now: Long, reason: HitReason, round: Boolean = false): Boolean {
         // 倒计时文本每秒都在变（"跳过 5s" -> "跳过 4s"），直接拿原文当 key
         // 等于没有判重。去掉数字和空白后才是同一个控件；再带上位置，
         // 让同文案但不同位置的控件彼此可区分（下面用 16px 容差认同一个按钮）。
@@ -743,7 +863,7 @@ class SkipAdService : AccessibilityService() {
         val age = now - windowAt
         val kind = SkipEngine.classify(
             ref.text, ref.desc, ref.id, b,
-            scanScreenW, scanScreenH, scanInSplash, reason,
+            scanScreenW, scanScreenH, scanInSplash, reason, round,
         )
         val facts = NodeFacts(
             pkg = policyPkg,
@@ -766,7 +886,10 @@ class SkipAdService : AccessibilityService() {
             sdkClose = SkipSources.sdkCloseHit(ref.id),
             explicitText =
                 (SkipEngine.builtin && SkipEngine.builtinHit(ref.text, ref.desc, "")) ||
-                    SkipSources.explicitAdClose(ref.text, ref.desc, ref.id),
+                    SkipSources.explicitAdClose(ref.text, ref.desc, ref.id) ||
+                    // 圆形倒计时本身就是明确的跳过按钮，按「明确文案」记分，
+                    // 否则纯数字控件拿不到分数会被 DecisionCore 判成低置信度。
+                    round,
             corner = SkipSources.closeCornerHit(
                 label, b.left, b.top, b.right, b.bottom, scanScreenW, scanScreenH,
             ),
@@ -806,9 +929,7 @@ class SkipAdService : AccessibilityService() {
                 Observation(
                     at = now,
                     pkg = policyPkg,
-                    appLabel = runCatching {
-                        SkipPolicyStore.displayName(this, policyPkg)
-                    }.getOrDefault(policyPkg),
+                    appLabel = labelOf(policyPkg),
                     text = ref.text,
                     desc = ref.desc,
                     id = ref.id,
@@ -837,7 +958,7 @@ class SkipAdService : AccessibilityService() {
                     Reject(
                         at = now,
                         pkg = policyPkg,
-                        appLabel = SkipPolicyStore.displayName(this, policyPkg),
+                        appLabel = labelOf(policyPkg),
                         target = ref.text.ifEmpty { ref.desc }.ifEmpty { ref.id },
                         level = d.level,
                         kind = d.kind,
@@ -893,7 +1014,9 @@ class SkipAdService : AccessibilityService() {
 
         // 控件本身与可点击祖先都点不动时，退化成按坐标点一下。
         // 坐标用二次验证时重新读到的位置，不用扫描时的旧值。
-        if (now - lastGestureAt > 700 && fresh.width() > 20 && fresh.height() > 20) {
+        if (gestureFallback && now - lastGestureAt > 700 &&
+            fresh.width() > 20 && fresh.height() > 20
+        ) {
             val path = Path().apply { moveTo(fresh.exactCenterX(), fresh.exactCenterY()) }
             val gesture = GestureDescription.Builder()
                 .addStroke(GestureDescription.StrokeDescription(path, 0, 40))
@@ -971,6 +1094,7 @@ class SkipAdService : AccessibilityService() {
 
     private fun mark(
         key: String, base: String, left: Int, top: Int, now: Long, d: Decision,
+        ad: Boolean = true,
     ) {
         scanHitRule = d.rule
         lastClickKey = key
@@ -986,18 +1110,44 @@ class SkipAdService : AccessibilityService() {
         // 否则 freshWindow 会一直为 true，把冷却判定在决策层抵消掉。
         windowFresh = false
         evidence.clear()
-        prefs.bumpSkip()
+        // 附加动作借的是冷却 / 去重 / 会话上限，不是广告统计与提示。
+        if (ad) {
+            prefs.bumpSkip()
+            showSkipToast(now)
+        }
         android.util.Log.i(
             "SkipAd",
-            "已点击跳过: $key 分数=${d.score} ${d.level.label} 规则=${d.rule} 冷却=2s",
+            "已点击${if (ad) "跳过" else "附加动作"}: $key 分数=${d.score} ${d.level.label} " +
+                "规则=${d.rule} 耗时=${now - windowAt}ms 冷却=2s",
         )
+    }
+
+    /** 跳过成功的轻提示：文案可自定义，800ms 内不重复弹，避免同窗口连点刷屏。 */
+    private fun showSkipToast(now: Long) {
+        if (!skipToast || observe || now - lastToastAt < TOAST_GAP_MS) return
+        lastToastAt = now
+        val text = toastText.ifBlank { DEFAULT_TOAST }
+        handler.post {
+            runCatching { Toast.makeText(this, text, Toast.LENGTH_SHORT).show() }
+        }
     }
 
     // ---------------- 规则热更新 ----------------
 
+    /** 开关类配置每次事件同步一次，服务进程内不反复读 SharedPreferences。 */
+    private fun syncFlags() {
+        observe = prefs.observeMode
+        ExtraRules.roundEnabled = prefs.roundCountdown
+        extraTeen = prefs.teenPopup
+        extraWechat = prefs.wechatOriginal
+        gestureFallback = prefs.gestureFallback
+        skipToast = prefs.skipToast
+        toastText = prefs.skipToastText
+    }
+
     private fun syncEngine() {
         SkipEngine.builtin = prefs.skipBuiltin
-        observe = prefs.observeMode
+        syncFlags()
         val cache = prefs.skipSubCache
         val custom = prefs.customRules
         if (cache != lastCache || custom != lastCustom) {
@@ -1046,14 +1196,23 @@ class SkipAdService : AccessibilityService() {
 
         /**
          * 开屏最初 3 秒的高频轮询。广告图先出、跳过按钮延迟渲染是常态，
-         * 这段窗口内 200ms 一轮，按钮出现后最坏等待从 700ms 降到 200ms；
-         * 3 秒后或成功命中后立刻回落到 [POLL_MS]，不增加常驻耗电。
+         * 这段窗口内 120ms 一轮；3 秒后或成功命中后立刻回落到 [POLL_MS]，
+         * 不增加常驻耗电。
+         *
+         * 带 FAST 后缀的四个值必须联动：scanGap 若大于轮询间隔，轮询扫描会被
+         * 自己的节流吃掉；合并窗口与首轮延时则是叠加在命中之前的固定等待，
+         * 只调其中一个几乎看不出提速。
          */
-        const val POLL_FAST_MS = 200L
+        const val POLL_FAST_MS = 120L
         const val POLL_FAST_WINDOW_MS = 3000L
 
-        /** 首次轮询延时，避开 OEM 启动过渡里的上一帧快照。 */
-        const val FIRST_POLL_DELAY_MS = 420L
+        /**
+         * 首次轮询延时。换窗口时已经做过一次 force 扫描，过渡帧拿不到按钮
+         * 是预期内；这里只需等过渡动画过去，不必等满 420ms。万一早一轮扫到
+         * 旧快照，点击前的二次验证还会复核，所以缩短它只多一两次空扫描，
+         * 不会带来误点。
+         */
+        const val FIRST_POLL_DELAY_MS = 160L
 
         /** 同一个窗口内总点击上限：一次首点 + 一次失败重试。 */
         const val MAX_SESSION_CLICKS = 2
@@ -1067,12 +1226,12 @@ class SkipAdService : AccessibilityService() {
         /** 内容变化事件合并窗口：120ms 内的连续变化只遍历一次节点树。 */
         const val SCAN_MERGE_MS = 120L
 
-        /** 开屏初期按钮刚渲染，合并窗口压到 50ms，别等一整轮。 */
-        const val SCAN_MERGE_FAST_MS = 50L
+        /** 开屏初期按钮刚渲染，首个事件立即扫描，不额外等待合并窗口。 */
+        const val SCAN_MERGE_FAST_MS = 0L
 
-        /** 非强制扫描的最小间隔：开屏初期 140ms，其余保持 200ms。 */
+        /** 非强制扫描的最小间隔：开屏初期 60ms，其余保持 200ms。 */
         const val SCAN_GAP_MS = 200L
-        const val SCAN_GAP_FAST_MS = 140L
+        const val SCAN_GAP_FAST_MS = 60L
 
         /** 单次遍历超时：超时即停，不让畸形界面拖住主线程。 */
         const val SCAN_TIMEOUT_MS = 120L
@@ -1090,6 +1249,15 @@ class SkipAdService : AccessibilityService() {
 
         /** 去掉数字后比较，倒计时文本才认得出是同一个按钮。 */
         val NUM = Regex("[0-9\\s]")
+
+        /** 跳过提示的默认文案；用户没填或清空时用它（界面回显同一来源）。 */
+        const val DEFAULT_TOAST = AppPrefs.DEFAULT_SKIP_TOAST
+
+        /** 附加动作全树判定的最小间隔，避免每轮轮询都做一次匹配。 */
+        const val EXTRA_SCAN_GAP_MS = 500L
+
+        /** 跳过提示最短间隔，同窗口连续命中不刷屏。 */
+        const val TOAST_GAP_MS = 800L
 
         /** 桌面：从桌面启动 App 是最典型的开屏场景，必须算「新会话」。 */
         val LAUNCHER_PKGS = setOf(

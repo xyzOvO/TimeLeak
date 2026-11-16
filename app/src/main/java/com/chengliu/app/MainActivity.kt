@@ -44,6 +44,7 @@ import androidx.compose.ui.unit.sp
 import com.chengliu.app.core.AppPrefs
 import com.chengliu.app.core.BlockLog
 import com.chengliu.app.core.LocalVpnService
+import com.chengliu.app.core.RecentsVisibility
 import com.chengliu.app.core.SkipGuardService
 import com.chengliu.app.core.Counters
 import com.chengliu.app.core.VpnState
@@ -77,6 +78,8 @@ class MainActivity : ComponentActivity() {
         RunStats.init(this)
         // 进程被回收后用户重新打开 App，也要把跳过广告的前台保活补回来。
         SkipGuardService.ensure(this)
+        // 最近任务隐藏是运行时设置，每次冷启动都要重新应用到本 task。
+        RecentsVisibility.apply(this, AppPrefs(this).hideFromRecents)
         // 服务没启动时也要能显示规则来源（打开拦截记录页即是最新的一批规则）
         SourceInfo.refresh(this, AppPrefs(this))
 

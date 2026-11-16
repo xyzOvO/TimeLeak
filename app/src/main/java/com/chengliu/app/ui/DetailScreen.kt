@@ -6,8 +6,12 @@ import com.chengliu.app.BuildConfig
 import android.content.Intent
 import android.os.Build
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -58,8 +62,11 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.LifecycleOwner
 import com.chengliu.app.core.AppPrefs
+import com.chengliu.app.core.BackupRestore
 import com.chengliu.app.core.PolicyMode
+import com.chengliu.app.core.RecentsVisibility
 import com.chengliu.app.core.SkipAdState
+import com.chengliu.app.core.SkipGuardService
 import com.chengliu.app.core.SkipPolicyStore
 import com.chengliu.app.core.BlockLog
 import com.chengliu.app.core.SourceInfo
@@ -1449,6 +1456,56 @@ private fun ActionButton(
     }
 }
 
+/** 高级卡内部的小节标题：比 SectionLabel 弱一级，避免折叠卡展开后喧宾夺主。 */
+@Composable
+private fun AdvancedGroupLabel(text: String) {
+    val ui = LocalUi.current
+    Spacer(Modifier.height(8.dp))
+    Text(text, fontSize = 12.sp, color = ui.text, fontWeight = FontWeight.Medium)
+    Spacer(Modifier.height(4.dp))
+}
+
+/**
+ * 长按改文案的行。单击只给一句操作提示，真正的编辑入口是长按，
+ * 免得在开关密布的设置页里滑一下就弹对话框。
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun LongPressLine(
+    title: String,
+    value: String,
+    hint: String,
+    onLongClick: () -> Unit,
+    onHintTap: () -> Unit,
+) {
+    val ui = LocalUi.current
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .combinedClickable(
+                role = Role.Button,
+                onClickLabel = "查看提示",
+                onLongClickLabel = "修改$title",
+                onClick = onHintTap,
+                onLongClick = onLongClick,
+            )
+            .padding(vertical = 8.dp, horizontal = 4.dp),
+    ) {
+        Text(title, fontSize = 14.sp, color = ui.text)
+        Spacer(Modifier.height(3.dp))
+        Text(
+            value,
+            fontSize = 12.sp,
+            color = ui.sub,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Spacer(Modifier.height(3.dp))
+        Note(hint)
+    }
+}
+
 @Composable
 private fun RuleRow(text: String, onRemove: () -> Unit) {
     val ui = LocalUi.current
@@ -1661,6 +1718,58 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     var policyQuery by remember { mutableStateOf("") }
     var showAllPresets by remember { mutableStateOf(false) }
     var installedApps by remember { mutableStateOf(emptyList<Pair<String, String>>()) }
+
+    // ---------------- 高级（默认折叠，不新增页面、不占主界面） ----------------
+    var showAdvanced by remember { mutableStateOf(false) }
+    var gestureFallback by remember { mutableStateOf(prefs.gestureFallback) }
+    var roundCountdown by remember { mutableStateOf(prefs.roundCountdown) }
+    var skipToast by remember { mutableStateOf(prefs.skipToast) }
+    var toastText by remember { mutableStateOf(prefs.skipToastText) }
+    var guardTitle by remember { mutableStateOf(prefs.guardTitle) }
+    var guardText by remember { mutableStateOf(prefs.guardText) }
+    var teenPopup by remember { mutableStateOf(prefs.teenPopup) }
+    var wechatOriginal by remember { mutableStateOf(prefs.wechatOriginal) }
+    var hideRecents by remember { mutableStateOf(prefs.hideFromRecents) }
+
+    var showToastEdit by remember { mutableStateOf(false) }
+    var toastInput by remember { mutableStateOf("") }
+    var showGuardEdit by remember { mutableStateOf(false) }
+    var guardTitleInput by remember { mutableStateOf("") }
+    var guardTextInput by remember { mutableStateOf("") }
+
+    // 只搬广告跳过规则：自定义规则正文 + 订阅地址，不带订阅正文缓存。
+    val adExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            ctx.contentResolver.openOutputStream(uri)?.use {
+                it.write(BackupRestore.exportAdRules(ctx).toByteArray(Charsets.UTF_8))
+            }
+            message = "广告规则已导出（自定义规则 + 订阅地址，不含订阅正文）"
+        }.onFailure { message = "导出失败：${it.message}" }
+    }
+    val adImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            val text = ctx.contentResolver.openInputStream(uri)?.use {
+                it.bufferedReader(Charsets.UTF_8).readText()
+            }.orEmpty()
+            message = BackupRestore.importAdRules(ctx, text)
+            // 导入是替换语义：界面上的订阅列表、规则编辑框与解析条数都要同步。
+            subs = prefs.skipSubs.sorted()
+            customInput = prefs.customRules
+            scope.launch {
+                withContext(Dispatchers.Default) {
+                    SkipEngine.ensureLoaded(prefs.skipSubCache, prefs.customRules)
+                }
+                subCount = SkipEngine.groupCount()
+                customCount = SkipEngine.keywordCount() + SkipEngine.popupCount()
+            }
+        }.onFailure { message = "导入失败：${it.message}" }
+    }
 
     LaunchedEffect(showAddPolicy) {
         if (!showAddPolicy) return@LaunchedEffect
@@ -2032,6 +2141,88 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
         )
     }
 
+    // 高级 · 长按改「跳过成功」提示语
+    if (showToastEdit) {
+        AlertDialog(
+            onDismissRequest = { showToastEdit = false },
+            containerColor = ui.card,
+            titleContentColor = ui.text,
+            textContentColor = ui.text,
+            title = { Text("跳过成功提示语", fontSize = 16.sp, fontWeight = FontWeight.Medium) },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = toastInput,
+                        onValueChange = { toastInput = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("最多 40 字，留空用「${AppPrefs.DEFAULT_SKIP_TOAST}」") },
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Note("每次成功跳过后弹一条短暂提示；同一屏连续命中 0.8 秒内只提示一次。留空即恢复默认。")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    prefs.skipToastText = toastInput
+                    toastText = prefs.skipToastText
+                    showToastEdit = false
+                    message = if (toastText.isEmpty()) "已恢复默认提示语" else "提示语已保存"
+                }) { Text("保存", color = ui.accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showToastEdit = false }) { Text("取消", color = ui.sub) }
+            },
+        )
+    }
+
+    // 高级 · 长按改前台保活通知文案；保存后重建通知，让用户立刻看到新文案。
+    if (showGuardEdit) {
+        AlertDialog(
+            onDismissRequest = { showGuardEdit = false },
+            containerColor = ui.card,
+            titleContentColor = ui.text,
+            textContentColor = ui.text,
+            title = { Text("前台保活通知文案", fontSize = 16.sp, fontWeight = FontWeight.Medium) },
+            text = {
+                Column {
+                    OutlinedTextField(
+                        value = guardTitleInput,
+                        onValueChange = { guardTitleInput = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("标题（最多 30 字）") },
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = guardTextInput,
+                        onValueChange = { guardTextInput = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("正文（最多 60 字）") },
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Note("留空回退到默认文案。通知只是把进程钉在前台，屏蔽或关掉通知不影响跳过广告授权。")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    prefs.guardTitle = guardTitleInput
+                    prefs.guardText = guardTextInput
+                    guardTitle = prefs.guardTitle
+                    guardText = prefs.guardText
+                    // ensure 是幂等的：同一通知 id 再 startForeground 一次即可刷新文案。
+                    SkipGuardService.ensure(ctx)
+                    showGuardEdit = false
+                    message = "保活通知文案已更新"
+                }) { Text("保存", color = ui.accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showGuardEdit = false }) { Text("取消", color = ui.sub) }
+            },
+        )
+    }
+
     if (message.isNotEmpty()) {
         Hint(message, ui.warn)
         Spacer(Modifier.height(12.dp))
@@ -2337,6 +2528,116 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
         Note("自动归类：银行 / 支付 / 政务 → 不自动点击；电商 → 只跳过开屏；短视频 → 仅明确开屏按钮；其余 → 开屏 + 推广弹窗。")
         Spacer(Modifier.height(6.dp))
         Note("逐应用的开关、保护名单、最近使用与导入导出在侧栏「应用规则」页；这里保留常用预置的快捷入口。")
+    }
+    Spacer(Modifier.height(12.dp))
+
+    // 高级：增强项全部收在这张默认折叠的卡里，不新增页面、不占主界面高度。
+    Card {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .clickable(
+                    role = Role.Button,
+                    onClickLabel = if (showAdvanced) "收起高级设置" else "展开高级设置",
+                ) { showAdvanced = !showAdvanced }
+                .padding(vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("高级", fontSize = 14.sp, color = ui.text, fontWeight = FontWeight.Medium)
+                Spacer(Modifier.height(3.dp))
+                Note("手势点击 · 提示语 · 保活文案 · 附加动作 · 规则备份")
+            }
+            Spacer(Modifier.width(8.dp))
+            Text(if (showAdvanced) "收起 ∧" else "展开 ∨", fontSize = 12.sp, color = ui.accent)
+        }
+        if (!showAdvanced) {
+            Spacer(Modifier.height(4.dp))
+            Note("默认折叠。展开后可逐项开关；两处文案长按对应行修改。")
+        } else {
+            Spacer(Modifier.height(8.dp))
+            AdvancedGroupLabel("点击与识别")
+            ToggleLine(
+                "手势点击兜底",
+                "控件自身点不动时，按坐标补一次手势点击；仍然走原来的广告判定与二次验证",
+                gestureFallback,
+            ) { gestureFallback = it; prefs.gestureFallback = it }
+            ToggleLine(
+                "识别圆形倒计时按钮",
+                "开屏角落只有「3」「3s」的圆形跳过按钮，按内置强信号识别；不是自绘坐标点击",
+                roundCountdown,
+            ) { roundCountdown = it; prefs.roundCountdown = it }
+
+            AdvancedGroupLabel("提示与保活")
+            ToggleLine(
+                "跳过成功时轻提示",
+                "成功点击后弹一条短提示；观察模式只识别不点击，也不弹提示",
+                skipToast,
+            ) { skipToast = it; prefs.skipToast = it }
+            LongPressLine(
+                title = "提示语文案",
+                value = if (toastText.isBlank()) AppPrefs.DEFAULT_SKIP_TOAST else toastText,
+                hint = "长按此行修改（最多 40 字）",
+                onLongClick = { toastInput = toastText; showToastEdit = true },
+                onHintTap = { message = "长按这一行即可修改提示语" },
+            )
+            LongPressLine(
+                title = "保活通知文案",
+                value = "${guardTitle.ifBlank { SkipGuardService.DEFAULT_TITLE }} · " +
+                    guardText.ifBlank { SkipGuardService.DEFAULT_TEXT },
+                hint = "长按此行修改标题与正文；前台服务已在运行，无需另开开关",
+                onLongClick = {
+                    guardTitleInput = guardTitle
+                    guardTextInput = guardText
+                    showGuardEdit = true
+                },
+                onHintTap = { message = "长按这一行即可修改保活通知文案" },
+            )
+            ToggleLine(
+                "隐藏最近任务卡片",
+                "在最近任务里不显示本应用；桌面图标、通知、前台服务与无障碍授权都不受影响",
+                hideRecents,
+            ) {
+                hideRecents = it
+                prefs.hideFromRecents = it
+                RecentsVisibility.apply(ctx, it)
+            }
+
+            AdvancedGroupLabel("附加动作（默认全关）")
+            ToggleLine(
+                "自动关闭青少年模式弹窗",
+                "同屏出现「青少年模式」提示、且只有一个「我知道了 / 关闭」按钮时才点；不会点「开启」类按钮",
+                teenPopup,
+            ) { teenPopup = it; prefs.teenPopup = it }
+            ToggleLine(
+                "微信自动查看原图",
+                "只在微信图片预览页识别「查看原图」；会消耗流量，按需开启",
+                wechatOriginal,
+            ) { wechatOriginal = it; prefs.wechatOriginal = it }
+            Spacer(Modifier.height(4.dp))
+            Note("这两项点的不是广告，走独立通道，但仍复用二次验证、冷却与每窗口点击上限；观察模式和设为「不自动点击」的应用一律不执行。")
+
+            AdvancedGroupLabel("广告规则备份")
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                ActionButton(
+                    "导出规则",
+                    { adExportLauncher.launch("timeleak-ad-rules.json") },
+                    Modifier.weight(1f),
+                    onCard = true,
+                )
+                ActionButton(
+                    "导入规则",
+                    { adImportLauncher.launch(arrayOf("application/json", "*/*")) },
+                    Modifier.weight(1f),
+                    onCard = true,
+                )
+            }
+            Spacer(Modifier.height(6.dp))
+            Note("只含自定义规则正文与订阅地址，不含订阅缓存、应用策略、DNS 配置和任何记录。导入是替换：文件里没有的字段保留当前值；订阅正文请点上面的「立即更新」重新拉取。")
+            Spacer(Modifier.height(6.dp))
+            Note("开关改动会在下一次界面事件生效，不需要重启服务。")
+        }
     }
     Spacer(Modifier.height(12.dp))
     Card {

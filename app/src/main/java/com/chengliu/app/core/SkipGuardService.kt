@@ -66,10 +66,12 @@ class SkipGuardService : Service() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+        val p = AppPrefs(this)
         return Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat)
-            .setContentTitle("跳过广告守护中")
-            .setContentText("可在通知设置里隐藏本条，功能不受影响")
+            // 文案可在跳过广告页长按修改；留空就回退到默认，避免通知变成空白。
+            .setContentTitle(p.guardTitle.ifBlank { DEFAULT_TITLE })
+            .setContentText(p.guardText.ifBlank { DEFAULT_TEXT })
             .setContentIntent(pi)
             .setOngoing(true)
             .setCategory(Notification.CATEGORY_SERVICE)
@@ -82,6 +84,8 @@ class SkipGuardService : Service() {
         private const val CHANNEL_ID = "chengliu_skip_guard"
         private const val ACTION_START = "com.chengliu.app.action.SKIP_GUARD_START"
         private const val ACTION_STOP = "com.chengliu.app.action.SKIP_GUARD_STOP"
+        const val DEFAULT_TITLE = "跳过广告守护中"
+        const val DEFAULT_TEXT = "可在通知设置里隐藏本条，功能不受影响"
 
         /** 幂等：开关开着就把进程钉在前台；重复调用不会叠加通知。 */
         fun ensure(ctx: Context) {

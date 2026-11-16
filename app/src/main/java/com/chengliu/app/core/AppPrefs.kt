@@ -331,6 +331,53 @@ class AppPrefs(ctx: Context) {
         sp.edit().putString(key, o.toString()).apply()
     }
 
+    // ---------------- 跳过广告 · 高级（全部默认不改变既有行为） ----------------
+
+    /** 跳过成功时弹一条轻提示；文案由 [skipToastText] 决定。 */
+    var skipToast: Boolean
+        get() = sp.getBoolean(KEY_SKIP_TOAST, true)
+        set(v) = sp.edit().putBoolean(KEY_SKIP_TOAST, v).apply()
+
+    /** 跳过成功提示语。留空则回退到默认文案，长按状态卡可改。 */
+    var skipToastText: String
+        get() = sp.getString(KEY_SKIP_TOAST_TEXT, "") ?: ""
+        set(v) = sp.edit().putString(KEY_SKIP_TOAST_TEXT, v.trim().take(40)).apply()
+
+    /** 前台保活通知的标题，长按状态卡可改。 */
+    var guardTitle: String
+        get() = sp.getString(KEY_GUARD_TITLE, "") ?: ""
+        set(v) = sp.edit().putString(KEY_GUARD_TITLE, v.trim().take(30)).apply()
+
+    /** 前台保活通知的正文，长按状态卡可改。 */
+    var guardText: String
+        get() = sp.getString(KEY_GUARD_TEXT, "") ?: ""
+        set(v) = sp.edit().putString(KEY_GUARD_TEXT, v.trim().take(60)).apply()
+
+    /** 节点点不动时，允许按坐标补一次手势点击。关掉只走控件自身点击。 */
+    var gestureFallback: Boolean
+        get() = sp.getBoolean(KEY_GESTURE_FALLBACK, true)
+        set(v) = sp.edit().putBoolean(KEY_GESTURE_FALLBACK, v).apply()
+
+    /** 识别开屏角落的圆形倒计时跳过按钮（只有数字、没有「跳过」二字的那种）。 */
+    var roundCountdown: Boolean
+        get() = sp.getBoolean(KEY_ROUND_COUNTDOWN, true)
+        set(v) = sp.edit().putBoolean(KEY_ROUND_COUNTDOWN, v).apply()
+
+    /** 自动关掉「青少年模式」提示弹窗。默认关：这会点非广告界面。 */
+    var teenPopup: Boolean
+        get() = sp.getBoolean(KEY_TEEN_POPUP, false)
+        set(v) = sp.edit().putBoolean(KEY_TEEN_POPUP, v).apply()
+
+    /** 微信图片预览页自动点「查看原图」。默认关：这会消耗流量。 */
+    var wechatOriginal: Boolean
+        get() = sp.getBoolean(KEY_WECHAT_ORIGINAL, false)
+        set(v) = sp.edit().putBoolean(KEY_WECHAT_ORIGINAL, v).apply()
+
+    /** 在最近任务列表里隐藏本应用卡片；不影响前台服务与无障碍授权。 */
+    var hideFromRecents: Boolean
+        get() = sp.getBoolean(KEY_HIDE_RECENTS, false)
+        set(v) = sp.edit().putBoolean(KEY_HIDE_RECENTS, v).apply()
+
     // ---------------- 今日统计（跨天自动归零） ----------------
 
     var skipToday: Int
@@ -382,6 +429,8 @@ class AppPrefs(ctx: Context) {
 
     companion object {
         const val DEFAULT_DOH = "https://dns.alidns.com/dns-query"
+        /** 跳过成功提示的默认文案；用户留空时服务与界面都回退到这一条。 */
+        const val DEFAULT_SKIP_TOAST = "已跳过广告"
         private const val KEY_BUILTIN = "builtin"
         private const val KEY_RULE_TIER = "rule_tier"
         private const val KEY_BLOCKED = "blocked"
@@ -424,5 +473,14 @@ class AppPrefs(ctx: Context) {
         private const val KEY_RULE_ERROR = "rule_load_error"
         private const val KEY_SUB_AUTO_APPLY = "sub_auto_apply"
         private const val KEY_LAST_NETWORK = "last_network_at"
+        private const val KEY_SKIP_TOAST = "skip_toast"
+        private const val KEY_SKIP_TOAST_TEXT = "skip_toast_text"
+        private const val KEY_GUARD_TITLE = "guard_title"
+        private const val KEY_GUARD_TEXT = "guard_text"
+        private const val KEY_GESTURE_FALLBACK = "gesture_fallback"
+        private const val KEY_ROUND_COUNTDOWN = "round_countdown"
+        private const val KEY_TEEN_POPUP = "teen_popup"
+        private const val KEY_WECHAT_ORIGINAL = "wechat_original"
+        private const val KEY_HIDE_RECENTS = "hide_from_recents"
     }
 }
