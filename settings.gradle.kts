@@ -20,5 +20,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "Chengliu"
+rootProject.name = "TimeLeak"
 include(":app")

@@ -2,7 +2,7 @@
 # 运行 JVM 单元测试。
 #
 # 为什么不直接用 `gradle testDebugUnitTest`：
-#   本工程路径含中文（D:/AI库/Chengliu）。Gradle 8.9 在 classpath 过长时会把测试
+#   本工程路径含中文（D:/AI库/TimeLeak）。Gradle 8.9 在 classpath 过长时会把测试
 #   JVM 的参数写成 @argfile（UTF-8），而 java.exe 读 @argfile 用的是系统编码
 #   （中文 Windows 为 GBK），中文路径被解成乱码，项目内的 class 目录在测试 JVM 里
 #   全部失效，表现为「用例被扫描到，但 7 个类全部 ClassNotFoundException」。
