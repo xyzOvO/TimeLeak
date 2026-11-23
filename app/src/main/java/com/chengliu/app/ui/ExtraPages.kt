@@ -746,7 +746,7 @@ fun PrivacyPage() {
             Spacer(Modifier.height(12.dp))
         }
         val dns = PrivacyAudit.dnsStatus(ctx)
-        val scopeEntry = PrivacyAudit.vpnScope(ctx)
+        val scopeEntry = PrivacyAudit.vpnScope()
         ExCard {
             ExLabel("DNS 加密状态")
             Text(dns.value, fontSize = 14.sp, color = ui.text)

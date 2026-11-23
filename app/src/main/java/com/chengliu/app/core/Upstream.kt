@@ -47,6 +47,7 @@ class SystemUdpResolver(
         target = picked.second
     }
 
+    @Suppress("DEPRECATION") // allNetworks 的替代 getAllNetworks() 要 API 31，本项目 minSdk=26 必须兼容老设备
     private fun pick(vpn: VpnService, fixed: String): Pair<Network?, InetAddress> {
         if (fixed.isNotBlank()) {
             try {

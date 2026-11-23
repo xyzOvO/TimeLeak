@@ -79,7 +79,7 @@ object PrivacyAudit {
     }
 
     /** VPN 流量范围：DNS-only 架构必须说清，免得用户以为所有流量都过我们的服务。 */
-    fun vpnScope(ctx: Context): Entry = Entry(
+    fun vpnScope(): Entry = Entry(
         "VPN 流量范围", "仅 DNS",
         "虚拟 DNS ${LocalVpnService.VIRTUAL_DNS} 与公共 DNS 的 /32 路由进隧道，没有默认路由。" +
             "应用自身的 HTTP、视频、下载等流量完全不经过本服务；因此也无法做「哪个 App 发的查询」归因。",

@@ -31,6 +31,9 @@ object ExtraRules {
     enum class Kind(val label: String) {
         TEEN_POPUP("青少年模式弹窗"),
         WECHAT_ORIGINAL("微信查看原图"),
+
+        /** 流氓 App 劫持广告 SDK 后由商店静默安装时弹出的确认框。 */
+        INSTALL_CANCEL("安装弹窗拦截"),
     }
 
     data class Hit(val kind: Kind, val index: Int, val label: String)
@@ -129,6 +132,69 @@ object ExtraRules {
         }
         val (i, n) = cands.singleOrNull() ?: return null
         return Hit(Kind.WECHAT_ORIGINAL, i, n.text.ifEmpty { n.desc })
+    }
+
+    /**
+     * 安装确认界面上必然出现的那几个「安装」按钮文案，用来确认这不是别的对话框。
+     * 刻意不含「下一步 / 继续」这类流程词，避免把安装向导的中间页误当成确认页。
+     *
+     * MIUI 把「首次安装」和「覆盖升级」拆成两套文案，真机实测：
+     *   首次安装：继续安装 / 取消安装
+     *   升级安装：继续更新 / 取消更新
+     * 两套都必须收，否则漏掉一半场景。
+     */
+    private val INSTALL_CONFIRM = setOf(
+        "安装", "立即安装", "继续安装", "安装应用", "确认安装", "一键安装", "安装并打开",
+        "继续更新", "立即更新", "更新应用", "确认更新", "一键更新",
+    )
+
+    /**
+     * 安装确认界面的拒绝按钮，是完整白名单。刻意不含「稍后」——它在安装向导里
+     * 可能是「稍后重启」，点了反而推进流程。
+     *
+     * 「取消安装 / 取消更新」是 MIUI 的真实文案（真机抓取），不是「取消」两个字的
+     * 变体，必须显式列出：这里是精确匹配，缺一个就整个拦截失效。
+     */
+    private val INSTALL_CANCEL = setOf(
+        "取消", "暂不安装", "以后再说", "放弃安装", "拒绝",
+        "取消安装", "取消更新", "暂不更新", "放弃更新",
+    )
+
+    /**
+     * 安装弹窗拦截：流氓 App 劫持广告 SDK 后，会借应用商店的系统级安装能力
+     * 拉起这个确认框。这是整条链路末端**唯一**能拦的一步。
+     *
+     * 安全约束比另外两条更严：
+     * - 只在安装器包名下调用（包名由服务层把关，这里不管）
+     * - 同屏必须出现「安装」按钮，否则不认，避免普通对话框的「取消」被误点
+     * - 只点拒绝按钮，**永远不点「安装」**，候选多于一个就整个放弃
+     *
+     * @param screenW 屏幕宽，用于排除横跨大半屏的整行按钮。
+     */
+    fun matchInstall(nodes: List<Node>, screenW: Int): Hit? {
+        if (nodes.isEmpty() || screenW <= 0) return null
+        // 先确认这是安装确认界面：没有「安装」按钮就一定是别的东西。
+        val hasConfirm = nodes.any { n ->
+            val s = n.text.ifEmpty { n.desc }.trim()
+            INSTALL_CONFIRM.contains(s)
+        }
+        if (!hasConfirm) return null
+        val cands = ArrayList<Pair<Int, Node>>(2)
+        for ((i, n) in nodes.withIndex()) {
+            val s = n.text.ifEmpty { n.desc }.trim()
+            if (s.isEmpty() || s.length > 6) continue
+            if (n.width >= screenW * 0.45f) continue
+            if (!INSTALL_CANCEL.contains(s)) continue
+            // MIUI 的拒绝按钮是 LinearLayout(clickable) 套一个 TextView(clickable=false)，
+            // collect() 收到的是里面那个文字节点，所以不能只认 clickable —— 真机上
+            // 死卡这一条会让拦截 100% 失效。改用「尺寸像按钮」兜底：说明文字要么更窄
+            // 要么更扁，能被这两条滤掉。实际点击由 extraClick 向上找可点父容器完成。
+            if (!n.clickable && (n.width < screenW * 0.12f || n.height < 56)) continue
+            cands.add(i to n)
+            if (cands.size > 1) return null
+        }
+        val (i, n) = cands.singleOrNull() ?: return null
+        return Hit(Kind.INSTALL_CANCEL, i, n.text.ifEmpty { n.desc })
     }
 
     /**

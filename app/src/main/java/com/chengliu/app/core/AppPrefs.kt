@@ -378,6 +378,23 @@ class AppPrefs(ctx: Context) {
         get() = sp.getBoolean(KEY_HIDE_RECENTS, false)
         set(v) = sp.edit().putBoolean(KEY_HIDE_RECENTS, v).apply()
 
+    /**
+     * 拦截系统安装弹窗：自动点「取消」。
+     * 默认关 —— 它会点非广告界面，而且用户自己正常装 App 时也会被拦下。
+     */
+    var blockInstall: Boolean
+        get() = sp.getBoolean(KEY_BLOCK_INSTALL, false)
+        set(v) = sp.edit().putBoolean(KEY_BLOCK_INSTALL, v).apply()
+
+    /**
+     * 安装拦截测试模式：不受「同一取消按钮最多点 2 次」的上限限制。
+     * 默认关 —— 只给反复验证安装拦截用；实测完必须关掉，否则同一弹窗会被无限点。
+     * 只在 [blockInstall] 打开时才有意义，不影响广告跳过与另外两条附加动作。
+     */
+    var installTestMode: Boolean
+        get() = sp.getBoolean(KEY_INSTALL_TEST_MODE, false)
+        set(v) = sp.edit().putBoolean(KEY_INSTALL_TEST_MODE, v).apply()
+
     // ---------------- 今日统计（跨天自动归零） ----------------
 
     var skipToday: Int
@@ -481,6 +498,8 @@ class AppPrefs(ctx: Context) {
         private const val KEY_ROUND_COUNTDOWN = "round_countdown"
         private const val KEY_TEEN_POPUP = "teen_popup"
         private const val KEY_WECHAT_ORIGINAL = "wechat_original"
+        private const val KEY_BLOCK_INSTALL = "block_install"
+        private const val KEY_INSTALL_TEST_MODE = "install_test_mode"
         private const val KEY_HIDE_RECENTS = "hide_from_recents"
     }
 }

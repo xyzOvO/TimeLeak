@@ -236,6 +236,7 @@ object LeakCheck {
     }
 
     /** 本机是否有真正的 IPv6 出口（非 VPN 网络上存在全局 v6 地址）。 */
+    @Suppress("DEPRECATION") // allNetworks 的替代 getAllNetworks() 要 API 31，本项目 minSdk=26 必须兼容老设备
     private fun hasIpv6Uplink(cm: ConnectivityManager?): Boolean {
         if (cm == null) return false
         return try {
@@ -284,6 +285,7 @@ object LeakCheck {
         }
     }
 
+    @Suppress("DEPRECATION") // 同上：allNetworks 在 minSdk=26 无替代
     private fun physical(cm: ConnectivityManager?): Network? {
         if (cm == null) return null
         return try {

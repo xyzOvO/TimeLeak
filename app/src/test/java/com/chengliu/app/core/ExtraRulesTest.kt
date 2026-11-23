@@ -168,4 +168,111 @@ class ExtraRulesTest {
     fun roundCountdownRejectsEmptyScreen() {
         assertFalse(ExtraRules.isRoundCountdown(corner(), 0, 0))
     }
+
+    // ---------------- 安装弹窗拦截 ----------------
+
+    private fun install(
+        nodes: List<ExtraRules.Node>,
+        w: Int = screenW,
+    ) = ExtraRules.matchInstall(nodes, w)
+
+    private fun cancelBtn(text: String = "取消", clickable: Boolean = true) =
+        node(text, left = 300, top = 1200, right = 460, bottom = 1280, clickable = clickable)
+
+    private fun confirmBtn(text: String = "安装") =
+        node(text, left = 540, top = 1200, right = 700, bottom = 1280, clickable = true)
+
+    @Test
+    fun installPopupPicksCancel() {
+        val hit = install(listOf(node("要安装此应用吗？", right = 900), confirmBtn(), cancelBtn()))
+        assertEquals(ExtraRules.Kind.INSTALL_CANCEL, hit?.kind)
+        assertEquals("取消", hit?.label)
+    }
+
+    @Test
+    fun installPopupNeverPicksInstall() {
+        // 只有「安装」没有「取消」时，一个都不点。
+        assertNull(install(listOf(node("要安装此应用吗？", right = 900), confirmBtn())))
+    }
+
+    @Test
+    fun installPopupRequiresConfirmButton() {
+        // 普通对话框里的「取消」不能被当成安装弹窗。
+        assertNull(install(listOf(node("确认退出登录？", right = 900), cancelBtn())))
+    }
+
+    @Test
+    fun installPopupRejectsMultipleCancelCandidates() {
+        val two = listOf(
+            confirmBtn(),
+            cancelBtn("取消"),
+            cancelBtn("以后再说").copy(left = 300, top = 1400, right = 460, bottom = 1480),
+        )
+        assertNull(install(two))
+    }
+
+    @Test
+    fun installPopupRejectsUnclickableTinyText() {
+        // 不可点击、尺寸也不像按钮的说明文字不点。
+        // （MIUI 的取消按钮是父容器 clickable、文字节点 clickable=false，所以不能再
+        //  只凭 clickable 判断，改用尺寸兜底。）
+        val tiny = node("取消", left = 300, top = 1200, right = 340, bottom = 1230, clickable = false)
+        assertNull(install(listOf(confirmBtn(), tiny)))
+    }
+
+    // ---------------- MIUI 真机文案（2026-11-23 抓取，Redmi Note 12 Turbo 1080×2400）----------------
+    //
+    // 首次安装：继续安装 / 取消安装
+    // 升级安装：继续更新 / 取消更新
+    // 取消按钮本身是 TextView(clickable=false)，可点的是它外面那层 LinearLayout。
+
+    private fun miuiCancel(text: String) =
+        node(text, left = 560, top = 2160, right = 1000, bottom = 2300, clickable = false)
+
+    private fun miuiConfirm(text: String) =
+        node(text, left = 218, top = 2202, right = 382, bottom = 2257, clickable = false)
+
+    @Test
+    fun installPopupMatchesMiuiFirstInstall() {
+        val nodes = listOf(
+            node("行影集", left = 319, top = 310, right = 457, bottom = 372),
+            miuiConfirm("继续安装"),
+            miuiCancel("取消安装"),
+        )
+        val hit = install(nodes, w = 1080)
+        assertEquals(ExtraRules.Kind.INSTALL_CANCEL, hit?.kind)
+        assertEquals("取消安装", hit?.label)
+    }
+
+    @Test
+    fun installPopupMatchesMiuiUpgrade() {
+        val nodes = listOf(
+            node("版本: 1.0.1 -> 1.0.9", left = 319, top = 402, right = 576, bottom = 444),
+            miuiConfirm("继续更新"),
+            miuiCancel("取消更新"),
+        )
+        val hit = install(nodes, w = 1080)
+        assertEquals(ExtraRules.Kind.INSTALL_CANCEL, hit?.kind)
+        assertEquals("取消更新", hit?.label)
+    }
+
+    @Test
+    fun installPopupNeverPicksMiuiConfirm() {
+        // 只有确认按钮、没有拒绝按钮时一个都不点（升级界面同理）。
+        assertNull(install(listOf(miuiConfirm("继续更新")), w = 1080))
+        assertNull(install(listOf(miuiConfirm("继续安装")), w = 1080))
+    }
+
+    @Test
+    fun installPopupRejectsWideButton() {
+        // 横跨大半屏的整行按钮不是对话框按钮。
+        val wide = node("取消", left = 0, top = 1200, right = 900, bottom = 1280, clickable = true)
+        assertNull(install(listOf(confirmBtn(), wide)))
+    }
+
+    @Test
+    fun installPopupRejectsEmptyScreen() {
+        assertNull(install(listOf(confirmBtn(), cancelBtn()), w = 0))
+        assertNull(install(emptyList()))
+    }
 }

@@ -1729,6 +1729,8 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     var guardText by remember { mutableStateOf(prefs.guardText) }
     var teenPopup by remember { mutableStateOf(prefs.teenPopup) }
     var wechatOriginal by remember { mutableStateOf(prefs.wechatOriginal) }
+    var blockInstall by remember { mutableStateOf(prefs.blockInstall) }
+    var installTestMode by remember { mutableStateOf(prefs.installTestMode) }
     var hideRecents by remember { mutableStateOf(prefs.hideFromRecents) }
 
     var showToastEdit by remember { mutableStateOf(false) }
@@ -2615,8 +2617,18 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                 "只在微信图片预览页识别「查看原图」；会消耗流量，按需开启",
                 wechatOriginal,
             ) { wechatOriginal = it; prefs.wechatOriginal = it }
+            ToggleLine(
+                "拦截安装弹窗",
+                "流氓 App 借应用商店的静默安装拉起确认框时，自动点「取消」。只认系统安装器，且同屏必须有「安装」按钮；你正常装 App 时也会被拦下，按需开启",
+                blockInstall,
+            ) { blockInstall = it; prefs.blockInstall = it }
+            ToggleLine(
+                "安装拦截测试模式",
+                "反复测同一个 APK 时，取消按钮会被「同一控件最多点 2 次」挡住。打开后不受这条上限限制，方便连测；只影响安装拦截，300ms 冷却仍在。测完记得关掉",
+                installTestMode,
+            ) { installTestMode = it; prefs.installTestMode = it }
             Spacer(Modifier.height(4.dp))
-            Note("这两项点的不是广告，走独立通道，但仍复用二次验证、冷却与每窗口点击上限；观察模式和设为「不自动点击」的应用一律不执行。")
+            Note("这几项点的不是广告，走独立通道，但仍复用二次验证、冷却与每窗口点击上限；观察模式和设为「不自动点击」的应用一律不执行。安装拦截会点系统界面，默认关闭。")
 
             AdvancedGroupLabel("广告规则备份")
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {

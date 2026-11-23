@@ -116,6 +116,9 @@ class SkipAdService : AccessibilityService() {
     /** 高级开关缓存：附加动作、圆形倒计时、手势兜底、跳过提示。每次事件同步一次。 */
     private var extraTeen = false
     private var extraWechat = false
+    private var extraInstall = false
+    /** 安装拦截测试模式：只放开安装拦截的 2 次上限，300ms 冷却与 600ms 扫描节流仍在。 */
+    private var installTestMode = false
     private var gestureFallback = true
     private var skipToast = true
     private var toastText = ""
@@ -123,6 +126,9 @@ class SkipAdService : AccessibilityService() {
 
     /** 附加动作节流，避免每轮轮询都做一次全树扫描。 */
     private var lastExtraAt = 0L
+
+    /** 安装弹窗节流：安装器窗口自己一套，不占广告扫描的节流。 */
+    private var lastInstallAt = 0L
 
     /** 本次遍历的绝对截止时刻，超过就停，避免畸形界面把主线程拖住。 */
     private var scanDeadline = 0L
@@ -203,6 +209,34 @@ class SkipAdService : AccessibilityService() {
         lastCache = prefs.skipSubCache
         lastCustom = prefs.customRules
         loadRules(lastCache, lastCustom)
+        // MIUI 会在安装框弹出瞬间把无障碍服务踢掉，2 秒后才重连。重连时窗口已经
+        // 静止、不再发事件，若只被动等事件就永远补不上那一帧。这里连上后主动
+        // 补扫一次：窗口是安装器就走拦截，普通应用就走广告扫描。延迟给窗口渲染。
+        handler.removeCallbacks(reconnectScan)
+        handler.postDelayed(reconnectScan, RECONNECT_SCAN_DELAY_MS)
+    }
+
+    /** 服务重连后的补扫：专门兜住「安装框弹出时服务被踢、重连后无事件」的场景。 */
+    private val reconnectScan = Runnable {
+        val root = rootInActiveWindow ?: return@Runnable
+        try {
+            val pkg = root.packageName?.toString() ?: return@Runnable
+            val now = System.currentTimeMillis()
+            android.util.Log.i("SkipAd", "重连补扫: pkg=$pkg")
+            if (INSTALLER_PKGS.contains(pkg)) {
+                // 走独立入口，但绕过 INSTALL_SCAN_GAP_MS 节流（刚断连，节流无意义）。
+                if (extraInstall && !observe) {
+                    lastInstallAt = 0L
+                    handleInstallWindow(pkg, now)
+                }
+            } else if (prefs.skipAdEnabled && pkg != packageName && !SKIP_PKGS.contains(pkg)) {
+                windowAt = now
+                windowFresh = true
+                scan(pkg, "", force = true)
+            }
+        } finally {
+            recycleNode(root)
+        }
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -220,13 +254,32 @@ class SkipAdService : AccessibilityService() {
             eventCount++
             android.util.Log.i("SkipAd", "事件 type=$type pkg=${e.packageName}")
         }
+        val now = System.currentTimeMillis()
+        // 安装拦截是「附加动作」里的独立开关（blockInstall），不是广告跳过的子功能。
+        // 必须在 skipAdEnabled 闸门之前分流：否则只开安装拦截、没开广告跳过时，
+        // 下面那个 return 会把所有安装器事件挡掉，拦截 100% 失效。
+        //
+        // 所有安装器事件都在这里收口，绝不落进 handleWindow / handleWindow 的
+        // 摇一摇回退与 curPkg 会话逻辑 —— 安装器本来就在 SKIP_PKGS，进广告链
+        // 既没有意义，还可能对确认框误触返回键。
+        if ((type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+                type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED)) {
+            val pkg = e.packageName?.toString()
+            if (pkg != null && INSTALLER_PKGS.contains(pkg)) {
+                syncFlags() // 配置热更新：blockInstall / installTestMode / observe
+                if (extraInstall && !observe) {
+                    // handleInstallWindow 内部还有 600ms 扫描节流与开关闸门。
+                    handleInstallWindow(pkg, now)
+                }
+                return
+            }
+        }
         if (!prefs.skipAdEnabled) {
             stopPolling()
             return
         }
         syncEngine()
 
-        val now = System.currentTimeMillis()
         when (type) {
             // 触摸类事件只更新「用户正在操作」时间戳，不扫描节点树。
             AccessibilityEvent.TYPE_VIEW_CLICKED,
@@ -388,6 +441,35 @@ class SkipAdService : AccessibilityService() {
     // ---------------- 扫描 ----------------
 
     /**
+     * 安装器窗口的独立入口：只做安装弹窗拦截，不进广告判定链。
+     *
+     * 安装器本来就在 SKIP_PKGS 里（扫广告没意义），只有用户打开安装拦截才放行。
+     * 刻意不复用 `windowAt` / `sessionClicks` —— 那是「开屏广告会话」的概念，
+     * 而安装弹窗可能在任何时刻弹出，跟当前 App 的会话毫无关系。
+     */
+    private fun handleInstallWindow(pkg: String, now: Long) {
+        if (!extraInstall || observe) return
+        if (now - lastInstallAt < INSTALL_SCAN_GAP_MS) return
+        // 上一轮扫描（可能是广告扫描）还没结束时，scan() 开头的 scanning 守卫
+        // 会把这一帧直接丢掉。这里**不能**先记 lastInstallAt —— 否则节流反而
+        // 堵住 600ms 内的重试，安装弹窗就漏了这一帧。留空让下一个安装事件重试。
+        if (scanning) return
+        // 刻意**不**检查 lastInteractAt：安装弹窗本来就是用户刚点完广告才弹出来的，
+        // 用「用户 900ms 内操作过就退让」会把拦截 100% 挡掉。防连点靠 clickCounts 去重。
+        lastInstallAt = now
+        scan(pkg, "", force = true)
+    }
+
+    /**
+     * 释放无障碍节点句柄。recycle() 自 API 33 起标记废弃（系统改为自动管理），
+     * 但本项目 minSdk=26：老设备上不主动回收会泄漏跨进程句柄，故保留调用并就地抑制告警。
+     */
+    @Suppress("DEPRECATION")
+    private fun recycleNode(node: AccessibilityNodeInfo?) {
+        runCatching { node?.recycle() }
+    }
+
+    /**
      * 扫描分三个场景，越往后越保守：
      *  A 开屏 0~9 秒：明确信号 + 订阅 / 自定义 / 弹窗规则
      *  B 开屏 9~12 秒：只认明确信号（倒计时结束、广告延迟渲染后才出现的按钮）
@@ -396,7 +478,9 @@ class SkipAdService : AccessibilityService() {
      * 无论哪一轮命中，最后都要过 [click] 里的广告类型 + 应用策略闸门。
      */
     private fun scan(pkg: String, activity: String?, force: Boolean) {
-        if (SKIP_PKGS.contains(pkg) || pkg == packageName) return
+        if (pkg == packageName) return
+        // 安装器在 SKIP_PKGS 里（扫广告没意义），只有开了安装拦截才放行。
+        if (SKIP_PKGS.contains(pkg) && !(extraInstall && INSTALLER_PKGS.contains(pkg))) return
         val now = System.currentTimeMillis()
         if (scanning) {
             // content-changed 触发的重复扫描不记心跳，否则列表会被「被节流合并」刷满。
@@ -435,6 +519,23 @@ class SkipAdService : AccessibilityService() {
             val realPkg = root.packageName?.toString() ?: pkg
             beatPkg = realPkg
             beatStage = if (inPoll) BeatStage.SPLASH else BeatStage.POPUP
+            // 安装器窗口：只跑安装弹窗拦截，不参与广告策略判定。
+            if (INSTALLER_PKGS.contains(realPkg)) {
+                if (extraInstall && !observe) {
+                    val screen = Rect(
+                        0, 0,
+                        resources.displayMetrics.widthPixels,
+                        resources.displayMetrics.heightPixels,
+                    )
+                    val refs = ArrayList<Ref>(64)
+                    collect(root, refs, 0, screen, deadline, 0)
+                    android.util.Log.i("SkipAd", "安装器扫描 $realPkg 节点=${refs.size}")
+                    scanInstall(refs, screen, now, realPkg)
+                }
+                beatResult = BeatResult.SELF
+                beatNote = "安装器界面"
+                return
+            }
             if (realPkg == packageName || SKIP_PKGS.contains(realPkg)) {
                 beatResult = BeatResult.SELF
                 beatNote = "窗口属于系统或本应用"
@@ -587,7 +688,7 @@ class SkipAdService : AccessibilityService() {
             beat(now, beatPkg, nodeCount, candidateCount, beatStage, beatResult, beatNote)
             // 扫描完成：把本次持有的所有节点引用一次性释放。
             // AccessibilityNodeInfo 是跨进程句柄，不能当普通对象缓存到下一轮。
-            for (n in scanNodes) runCatching { n.recycle() }
+            for (n in scanNodes) recycleNode(n)
             scanNodes.clear()
             scanning = false
         }
@@ -685,15 +786,73 @@ class SkipAdService : AccessibilityService() {
         return extraClick(ref, now, hit)
     }
 
+    /**
+     * 安装弹窗拦截的判定入口。
+     *
+     * 执行器复用 [extraClick]，所以二次验证、去重、可点击性检查全都不新增。
+     * 只有两点不同：
+     * ① 冷却用 300ms —— 安装弹窗通常在点完广告后立刻弹出来，800ms 的广告冷却
+     *    会把这次拦截整个挡掉；
+     * ② 不检查 `sessionClicks` —— 那是开屏广告会话的上限，与安装弹窗无关。
+     */
+    private fun scanInstall(refs: List<Ref>, screen: Rect, now: Long, pkg: String): Boolean {
+        if (refs.isEmpty()) return false
+        val nodes = refs.map {
+            ExtraRules.Node(
+                it.text, it.desc, it.id,
+                it.bounds.left, it.bounds.top, it.bounds.right, it.bounds.bottom,
+                it.clickable,
+            )
+        }
+        val hit = ExtraRules.matchInstall(nodes, screen.width())
+        if (hit == null) {
+            // 真机排障用：拦截没生效时，这条能直接看出是文案没对上还是尺寸被过滤。
+            val w = screen.width()
+            val brief = nodes.asSequence()
+                .map { it.text.ifEmpty { it.desc }.trim() to it }
+                .filter { it.first.isNotEmpty() && it.first.length <= 6 }
+                .take(10)
+                .joinToString(" / ") { "${it.first}(${it.second.width}x${it.second.height},c=${it.second.clickable})" }
+            android.util.Log.i("SkipAd", "安装器未命中 W=$w 短文本=$brief")
+            return false
+        }
+        val ref = refs.getOrNull(hit.index)
+        if (ref == null) {
+            android.util.Log.i("SkipAd", "安装器索引越界 index=${hit.index} refs=${refs.size}")
+            return false
+        }
+        return extraClick(
+            ref, now, hit, INSTALL_CLICK_GAP_MS,
+            expectPkg = pkg, installMode = true,
+        )
+    }
+
     /** 附加动作的唯一执行出口：二次验证 -> 控件点击 -> 可选手势兜底 -> 统一记账。 */
-    private fun extraClick(ref: Ref, now: Long, hit: ExtraRules.Hit): Boolean {
+    private fun extraClick(
+        ref: Ref,
+        now: Long,
+        hit: ExtraRules.Hit,
+        gapMs: Long = CLICK_GAP_MS,
+        expectPkg: String = policyPkg,
+        installMode: Boolean = false,
+    ): Boolean {
         val base = "extra:${hit.kind.name}|" + ref.id + "|" + ref.text.replace(NUM, "")
         val key = base + "|" + ref.bounds.left + "," + ref.bounds.top
-        if ((clickCounts[key] ?: 0) >= MAX_SAME_CLICKS) return false
-        if (now - lastClickAt < CLICK_GAP_MS) return false
-        val node = scanNodes.getOrNull(ref.nodeIndex) ?: return false
+        if ((clickCounts[key] ?: 0) >= MAX_SAME_CLICKS) {
+            android.util.Log.i("SkipAd", "附加动作未执行(${hit.kind.label}): 同控件已点满")
+            return false
+        }
+        if (now - lastClickAt < gapMs) {
+            android.util.Log.i("SkipAd", "附加动作未执行(${hit.kind.label}): 冷却中，还差 ${gapMs - (now - lastClickAt)}ms")
+            return false
+        }
+        val node = scanNodes.getOrNull(ref.nodeIndex)
+        if (node == null) {
+            android.util.Log.i("SkipAd", "附加动作未执行(${hit.kind.label}): 节点索引失效 idx=${ref.nodeIndex} size=${scanNodes.size}")
+            return false
+        }
         val fresh = Rect()
-        val denied = verifyBeforeClick(ref, node, fresh)
+        val denied = verifyBeforeClick(ref, node, fresh, expectPkg, installMode)
         if (denied != null) {
             android.util.Log.i("SkipAd", "附加动作未执行(${hit.kind.label}): $denied")
             return false
@@ -746,6 +905,12 @@ class SkipAdService : AccessibilityService() {
             ),
             ad = false,
         )
+        // 测试模式：mark() 刚给这个控件记了一次，立刻抹掉，让它永远停在 1 次，
+        // 从而绕过 MAX_SAME_CLICKS 的 2 次上限；关掉开关后计数也是干净的。
+        // 只针对安装拦截，青少年的「我知道了」和微信原图仍受原上限约束。
+        if (installTestMode && hit.kind == ExtraRules.Kind.INSTALL_CANCEL) {
+            clickCounts.remove(key)
+        }
         android.util.Log.i("SkipAd", "附加动作已执行: ${hit.kind.label} ${hit.label}")
     }
 
@@ -1038,7 +1203,20 @@ class SkipAdService : AccessibilityService() {
      *
      * @return null 表示通过；否则返回中文原因。
      */
-    private fun verifyBeforeClick(ref: Ref, node: AccessibilityNodeInfo, fresh: Rect): String? {
+    /**
+     * @param expectPkg 本次点击期望的前台包名。默认是广告策略包；
+     *   安装拦截要传安装器包名，否则「前台已切到 xxx」会永远判失败。
+     * @param installMode 安装拦截专用：跳过「像不像跳过按钮」与 DISABLED 策略检查。
+     *   安装框里的「暂不安装 / 放弃安装」含 CTA 词「安装」，会被 [SkipEngine.isSafeTarget]
+     *   整条挡掉；而 DISABLED 说的是当前 App 的广告策略，与系统安装框无关。
+     */
+    private fun verifyBeforeClick(
+        ref: Ref,
+        node: AccessibilityNodeInfo,
+        fresh: Rect,
+        expectPkg: String = policyPkg,
+        installMode: Boolean = false,
+    ): String? {
         if (!node.refresh()) return "控件已消失"
         if (!node.isVisibleToUser || !node.isEnabled) return "控件已不可见"
         node.getBoundsInScreen(fresh)
@@ -1052,18 +1230,18 @@ class SkipAdService : AccessibilityService() {
         }
         val t = node.text?.toString()?.trim().orEmpty()
         if (t.replace(NUM, "") != ref.text.replace(NUM, "")) return "控件文字变了"
-        if (!SkipEngine.isSafeTarget(t, node.contentDescription?.toString().orEmpty())) {
+        if (!installMode && !SkipEngine.isSafeTarget(t, node.contentDescription?.toString().orEmpty())) {
             return "控件不再像跳过按钮"
         }
         // 窗口归属再确认：用户可能已经从开屏页点进主页，这时按旧坐标点就是误触。
         val root = rootInActiveWindow ?: return "当前窗口读不到"
         try {
             val top = root.packageName?.toString().orEmpty()
-            if (top.isNotEmpty() && top != policyPkg) return "前台已切到 $top"
+            if (top.isNotEmpty() && top != expectPkg) return "前台已切到 $top"
         } finally {
-            runCatching { root.recycle() }
+            recycleNode(root)
         }
-        if (currentPolicy.mode == PolicyMode.DISABLED) return "该应用策略为不自动点击"
+        if (!installMode && currentPolicy.mode == PolicyMode.DISABLED) return "该应用策略为不自动点击"
         return null
     }
 
@@ -1140,6 +1318,8 @@ class SkipAdService : AccessibilityService() {
         ExtraRules.roundEnabled = prefs.roundCountdown
         extraTeen = prefs.teenPopup
         extraWechat = prefs.wechatOriginal
+        extraInstall = prefs.blockInstall
+        installTestMode = prefs.installTestMode
         gestureFallback = prefs.gestureFallback
         skipToast = prefs.skipToast
         toastText = prefs.skipToastText
@@ -1255,6 +1435,35 @@ class SkipAdService : AccessibilityService() {
 
         /** 附加动作全树判定的最小间隔，避免每轮轮询都做一次匹配。 */
         const val EXTRA_SCAN_GAP_MS = 500L
+
+        /** 安装器窗口的扫描间隔。比附加动作略宽：安装弹窗只有一次有效时机。 */
+        const val INSTALL_SCAN_GAP_MS = 600L
+
+        /** 服务重连后补扫的延迟：给安装器窗口渲染留时间。 */
+        const val RECONNECT_SCAN_DELAY_MS = 400L
+
+        /**
+         * 安装拦截的点击冷却。刻意短于广告的 800ms：安装弹窗大多在点完广告
+         * 后立刻弹出来，用广告冷却会把这次拦截整个挡掉。
+         */
+        const val INSTALL_CLICK_GAP_MS = 300L
+
+        /**
+         * 系统安装器。这些包在 SKIP_PKGS 里（扫广告没意义），只有安装拦截
+         * 开关打开时才单独放行，并且只跑 [ExtraRules.matchInstall] 一条判定。
+         *
+         * 覆盖主流 ROM 的安装器包名；不在表内的厂商安装器不会误伤，
+         * 只是拦不到而已 —— 宁可漏拦，不要乱点。
+         */
+        val INSTALLER_PKGS = setOf(
+            "com.android.packageinstaller",
+            "com.miui.packageinstaller",
+            "com.google.android.packageinstaller",
+            "com.samsung.android.packageinstaller",
+            "com.oppo.packageinstaller",
+            "com.vivo.packageinstaller",
+            "com.huawei.packageinstaller",
+        )
 
         /** 跳过提示最短间隔，同窗口连续命中不刷屏。 */
         const val TOAST_GAP_MS = 800L
