@@ -1,0 +1,213 @@
+name: Auto Release
+
+# 推 v* tag 触发全自动发版：
+#   1. 解析 tag → versionName，versionCode 从上一个 tag 自动 +1
+#   2. 用 commit 说明生成 update.json 的 notes
+#   3. 还原 debug.keystore（Secret）→ 构建 release → JVM 单测
+#   4. 校验 APK 版本 → 换根目录 app-release.apk
+#   5. 提交版本号/update.json/APK 回 main → 建 Release 上传同名附件
+#
+# 前置：仓库 Settings → Secrets and variables → Actions 里加
+#   DEBUG_KEYSTORE_BASE64 = 本机 ~/.android/debug.keystore 的 base64 单行文本
+#   （生成命令：base64 -w0 ~/.android/debug.keystore）
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Restore debug keystore
+        env:
+          DEBUG_KEYSTORE_BASE64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "${DEBUG_KEYSTORE_BASE64}" ]; then
+            echo "::error::缺少 Secret DEBUG_KEYSTORE_BASE64，无法保证签名一致"
+            exit 1
+          fi
+          mkdir -p "$HOME/.android"
+          printf '%s' "${DEBUG_KEYSTORE_BASE64}" | base64 -d > "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+          keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey >/dev/null
+          echo "keystore restored"
+
+      - name: Resolve version from tag
+        id: ver
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          NAME="${TAG#v}"
+          # 版本号三段必须都是数字，避免脏 tag 进版本字段
+          if ! printf '%s' "${NAME}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::tag 必须是 vX.Y.Z 形式，当前=${TAG}"
+            exit 1
+          fi
+          # 从 tag 对应提交读当前源码 versionCode，+1 作为新值
+          CODE=$(grep -oE 'versionCode = [0-9]+' app/build.gradle.kts | grep -oE '[0-9]+' | head -1)
+          if [ -z "${CODE}" ]; then
+            echo "::error::读不到当前 versionCode"
+            exit 1
+          fi
+          NEXT=$((CODE + 1))
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "code=${NEXT}" >> "$GITHUB_OUTPUT"
+          echo "resolved: ${TAG} -> versionCode=${NEXT}"
+
+      - name: Bump version in build.gradle.kts
+        env:
+          CODE: ${{ steps.ver.outputs.code }}
+          NAME: ${{ steps.ver.outputs.name }}
+        run: |
+          python3 - "$CODE" "$NAME" <<'PY'
+          import re, sys
+          code, name = sys.argv[1], sys.argv[2]
+          p = 'app/build.gradle.kts'
+          s = open(p, encoding='utf-8').read()
+          s = re.sub(r'versionCode = \d+', f'versionCode = {code}', s, count=1)
+          s = re.sub(r'versionName = "[^"]+"', f'versionName = "{name}"', s, count=1)
+          open(p, 'w', encoding='utf-8', newline='\n').write(s)
+          PY
+          grep -nE 'versionCode|versionName' app/build.gradle.kts
+
+      - name: Generate release notes from commits
+        id: notes
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          NAME: ${{ steps.ver.outputs.name }}
+        run: |
+          set -euo pipefail
+          # 找当前 tag 的父提交上最近的一个 v* tag；首版时退化为该 tag 之前全部提交
+          PREV=$(git describe --tags --abbrev=0 --match 'v*' "${TAG}^" 2>/dev/null || true)
+          if [ -n "${PREV}" ]; then
+            RANGE="${PREV}..${TAG}"
+          else
+            RANGE="${TAG}"
+          fi
+          BODY=$(git log --no-merges --pretty=format:'- %s' "${RANGE}" | grep -v '^- chore:' || true)
+          if [ -z "${BODY}" ]; then
+            BODY="- 常规修复与优化"
+          fi
+          {
+            echo "Time Leak ${NAME}"
+            echo
+            echo "${BODY}"
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Build release
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon clean assembleRelease writeUnitTestClasspath
+
+      - name: Run JVM unit tests
+        # 不用标准 testDebugUnitTest：Gradle 8.9 在 classpath 过长时写 @argfile，
+        # 部分 JVM 读 @argfile 的编码与文件不一致会导致 ClassNotFoundException。
+        # 这里复用 build.gradle.kts 导出的 classpath，直接启动 JUnit，与本地 run-tests.sh 一致。
+        run: |
+          set -euo pipefail
+          CP="$(cat app/build/unitTestClasspath.txt)"
+          java -cp "$CP" org.junit.runner.JUnitCore \
+            com.chengliu.app.core.DnsWireTest \
+            com.chengliu.app.core.IpWireTest \
+            com.chengliu.app.core.RuleEngineTest \
+            com.chengliu.app.core.CaptureRoutesTest \
+            com.chengliu.app.core.Json5Test \
+            com.chengliu.app.core.FloodGuardTest \
+            com.chengliu.app.core.UpdateCheckerTest \
+            com.chengliu.app.core.SkipEngineNegationTest \
+            com.chengliu.app.core.ClickTargetTest \
+            com.chengliu.app.core.ExtraRulesTest \
+            com.chengliu.app.core.AdRulesCodecTest
+
+      - name: Verify APK metadata
+        env:
+          CODE: ${{ steps.ver.outputs.code }}
+          NAME: ${{ steps.ver.outputs.name }}
+        run: |
+          set -euo pipefail
+          # aapt2 的 dump badging 输出格式与 aapt 不同，优先用 aapt
+          AAPT=$(find "$ANDROID_SDK_ROOT/build-tools" -type f -name aapt | sort | tail -1)
+          if [ -z "${AAPT}" ]; then
+            echo "::error::找不到 aapt，无法校验 APK"
+            exit 1
+          fi
+          INFO=$("${AAPT}" dump badging app/build/outputs/apk/release/app-release.apk)
+          echo "${INFO}" | grep -E "versionCode='${CODE}'" >/dev/null
+          echo "${INFO}" | grep -E "versionName='${NAME}'" >/dev/null
+          echo "APK version verified: ${NAME} (${CODE})"
+          echo "MD5: $(md5sum app/build/outputs/apk/release/app-release.apk | cut -d' ' -f1)"
+
+      - name: Update update.json
+        env:
+          NAME: ${{ steps.ver.outputs.name }}
+        run: |
+          python3 - "$NAME" <<'PY'
+          import json, sys
+          name = sys.argv[1]
+          notes = open('release-notes.md', encoding='utf-8').read().strip()
+          with open('update.json', encoding='utf-8') as f:
+              data = json.load(f)
+          data['version'] = name
+          data['notes'] = notes
+          with open('update.json', 'w', encoding='utf-8', newline='\n') as f:
+              json.dump(data, f, ensure_ascii=False, indent=2)
+              f.write('\n')
+          PY
+          cat update.json
+
+      - name: Replace publish artifact
+        run: cp app/build/outputs/apk/release/app-release.apk app-release.apk
+
+      - name: Commit metadata back to main
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          NAME: ${{ steps.ver.outputs.name }}
+          CODE: ${{ steps.ver.outputs.code }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app/build.gradle.kts update.json app-release.apk
+          if git diff --cached --quiet; then
+            echo "no metadata changes, skip commit"
+          else
+            git commit -m "chore: 自动发版 ${TAG} (versionCode ${CODE}) [skip ci]"
+            git push origin HEAD:main
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.tag }}
+          body_path: release-notes.md
+          files: app-release.apk
+          fail_on_unmatched_files: true
