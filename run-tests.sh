@@ -49,6 +49,7 @@ TEST_CLASSES=(
   com.chengliu.app.core.ScanPacingTest
   com.chengliu.app.core.EmitThrottleTest
   com.chengliu.app.core.SkipEngineLoadTest
+  com.chengliu.app.core.SystemPkgsTest
 )
 
 exec "$JAVA_HOME/bin/java" -cp "$CP" org.junit.runner.JUnitCore "${TEST_CLASSES[@]}"

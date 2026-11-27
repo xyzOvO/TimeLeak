@@ -55,8 +55,10 @@ Two steps after install, or features won't work:
 | **Pre-click re-verification** | Right before acting, the node is re-read: still present, still visible, bounds not drifted (±16px), text unchanged, window still owned by the same app — any mismatch aborts the click and records why |
 | **Per-app policy** | Presets plus per-package overrides, see below |
 | **Shake landing-page rollback** | Without root we can't block sensors; we only roll back "jumped to browser/store/shop" landing pages, max once per target / 10s |
-| **Idle backoff** | After several rounds with no candidate, the event-merge window widens from 120ms up to 480ms; any candidate or window change pulls it back at once, so CPU isn't burned on screens without ads |
-| **Visible scan cost** | Every "scan heartbeat" entry records how long that scan took (ms), so it's obvious whether a speed-up actually helped |
+| **Idle backoff** | After several rounds where nothing was actually clicked, the event-merge window widens from 120ms up to 480ms; a click or a window change pulls it back at once. The signal is "did anything get clicked", not "were there candidates" — a splash-ad screen always yields a few narrow candidates, so keying off candidates meant the backoff never kicked in on exactly the screens that needed it |
+| **System UI never scanned** | Launchers, system search (`com.android.quicksearchbox` and friends), wallpaper pickers, IMEs and installer screens are skipped outright. Launcher package names aren't hardcoded — they're resolved from `PackageManager` at startup, so a different ROM keeps working |
+| **Launcher-transition retry** | When an app is cold-started from the launcher, the event already carries the app's package while the active window is still the launcher. That round used to be dropped entirely (19 drops in one real test run: Douyu, Baidu Maps, Amap, Fliggy); now it's re-scanned once after 180ms, at most 3 times |
+| **Visible scan cost** | Every "scan heartbeat" entry records how long that scan took, split into "tree X · match Y" — so it's obvious whether the cost is cross-process node reads or rule matching |
 
 Per-app policies are edited on the "Skip Ads" and "App rules" pages; **explicit user settings win over presets and auto-classification**:
 
@@ -248,6 +250,7 @@ A: The app's scope is lightweight filtering + splash skipping. DNS-only already 
 - **Splash skipping**: the accessibility service watches window events and actively polls windows for ~12s after an external entry; scanning goes in three rounds — ad-SDK resource names → user coordinates → text whitelist. At most 2 clicks per window and only the same control, text only on narrow + short controls, plus a CTA / deny-word blacklist to avoid misfires.
 - **Matching cost**: selector values are lowercased and regexes compiled once at load time; during a scan each node's text is lowercased once and reused across hundreds of rules (previously every clause lowered it again, and `contains(ignoreCase = true)` folds case position by position). When the subscription contains no `[name=]` selector, `className` isn't even read, saving one cross-process call per node. On the benchmark sample, match time went from 83.7µs to 17.1µs per node.
 - **Battery**: DNS counters no longer push a UI refresh for every packet — at most one per 250ms plus a trailing emit (no value lost, UI at most 250ms behind), and the date check runs at most once a second; on the scan side, the merge window backs off to 480ms while idle. The DNS read loop blocks in `poll` instead of busy-waiting.
+- **Who was spinning**: one real v1.4.0 test run did 99 full-tree scans — 49 of them on `com.android.quicksearchbox`, 31 on a market app, 17 on a browser. The top spender wasn't an ad-bearing app at all, it was the system search entry point. Keeping it (and the launcher) out of scanning is the most direct battery win in this batch.
 
 ---
 

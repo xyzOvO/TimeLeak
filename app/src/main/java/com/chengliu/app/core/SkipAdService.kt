@@ -148,6 +148,25 @@ class SkipAdService : AccessibilityService() {
      */
     private val pacer = ScanPacer(SCAN_MERGE_MS, SCAN_MERGE_MS, SCAN_MERGE_MAX_MS)
 
+    /**
+     * 桌面过渡期补扫状态。
+     *
+     * 冷启动那一瞬，事件里的包名已经是目标应用，活动窗口却还停在桌面：
+     * 直接丢掉这一轮，等于白丢开屏窗最早的一次机会（v1.4.0 真机实测丢掉 19 次，
+     * 斗鱼 / 百度地图 / 高德 / 飞猪都中招）。补扫不换树、不放宽任何闸门，
+     * 只是 180ms 后再走一次正常的 rootInActiveWindow + verifyBeforeClick。
+     */
+    private var launcherRetryPkg: String? = null
+    private var launcherRetryAt = 0L
+    private var launcherRetryCount = 0
+    private val launcherRetry = object : Runnable {
+        override fun run() {
+            val p = launcherRetryPkg ?: return
+            launcherRetryPkg = null
+            scan(p, curAct, force = true)
+        }
+    }
+
     /** 应用名缓存：心跳每条都要显示应用名，不能每次都问 PackageManager。 */
     private val labelCache = HashMap<String, String>()
 
@@ -211,6 +230,8 @@ class SkipAdService : AccessibilityService() {
         // 系统重新绑定成功时补一次保活，避免之后又被省电策略回收。
         SkipGuardService.ensure(this)
         syncFlags()
+        // 桌面包名问系统要，别硬编码：MIUI 叫 com.miui.home，换 ROM 就换名字。
+        refreshLauncherPkgs(resolveHomePkgs())
         SkipEngine.builtin = prefs.skipBuiltin
         lastCache = prefs.skipSubCache
         lastCustom = prefs.customRules
@@ -235,7 +256,7 @@ class SkipAdService : AccessibilityService() {
                     lastInstallAt = 0L
                     handleInstallWindow(pkg, now)
                 }
-            } else if (prefs.skipAdEnabled && pkg != packageName && !SKIP_PKGS.contains(pkg)) {
+            } else if (prefs.skipAdEnabled && pkg != packageName && !isSkipPkg(pkg)) {
                 windowAt = now
                 windowFresh = true
                 scan(pkg, "", force = true)
@@ -311,7 +332,7 @@ class SkipAdService : AccessibilityService() {
                 // curPkg 会在 App 和 systemui 之间来回翻，每次切换都把点击计数
                 // 清零，防连点的保护就废了。桌面同理。
                 if (pkg == packageName || pkg == "com.android.systemui") return
-                if (SKIP_PKGS.contains(pkg)) return
+                if (isSkipPkg(pkg)) return
                 // 兜底：无障碍服务如果是在 App 已经在前台之后才连上的
                 // （重装、系统回收、手动开启都是这种情况），就再也收不到
                 // TYPE_WINDOW_STATE_CHANGED，整个功能等于没开。
@@ -340,10 +361,31 @@ class SkipAdService : AccessibilityService() {
         }
     }
 
+    /**
+     * 桌面过渡期补扫：活动窗口还是桌面、事件包名已经是目标应用时补一次短延迟重扫。
+     * 只补 [LAUNCHER_RETRY_MAX] 次、两次之间至少 [LAUNCHER_RETRY_GAP_MS]，
+     * 免得用户就停在桌面上时无休止地空转。
+     */
+    private fun scheduleLauncherRetry(pkg: String, winPkg: String, now: Long) {
+        if (!isSkipPkg(winPkg)) return
+        if (pkg == packageName || isSkipPkg(pkg)) return
+        if (launcherRetryCount >= LAUNCHER_RETRY_MAX) return
+        if (now - launcherRetryAt < LAUNCHER_RETRY_GAP_MS) return
+        launcherRetryAt = now
+        launcherRetryCount++
+        launcherRetryPkg = pkg
+        handler.removeCallbacks(launcherRetry)
+        handler.postDelayed(launcherRetry, LAUNCHER_RETRY_DELAY_MS)
+    }
+
     /** 处理一次「前台换成了 pkg/act」，窗口事件与内容变化事件共用。 */
     private fun handleWindow(pkg: String, act: String, now: Long) {
         // 换窗口 = 新页面开局，空转退避清零，开屏窗必须立刻扫。
         pacer.reset()
+        // 新窗口已经在手上了，过渡期那次补扫就没意义了，先撤掉。
+        handler.removeCallbacks(launcherRetry)
+        launcherRetryPkg = null
+        launcherRetryCount = 0
         val from = curPkg
         val fromOther = from == null || from != pkg
         if (from != null && from != pkg) {
@@ -364,7 +406,7 @@ class SkipAdService : AccessibilityService() {
         }
         curPkg = pkg
         curAct = act
-        if (pkg == packageName || SKIP_PKGS.contains(pkg)) {
+        if (pkg == packageName || isSkipPkg(pkg)) {
             stopPolling()
             return
         }
@@ -442,7 +484,7 @@ class SkipAdService : AccessibilityService() {
     private fun autoPoll(): Boolean {
         val pkg = curPkg ?: return false
         if (!prefs.skipAdEnabled) return false
-        if (SKIP_PKGS.contains(pkg) || pkg == packageName) return false
+        if (isSkipPkg(pkg) || pkg == packageName) return false
         if (sessionClicks >= MAX_SESSION_CLICKS) return false
         val now = System.currentTimeMillis()
         if (now - windowAt > SPLASH_POLL_MS) return false
@@ -493,7 +535,7 @@ class SkipAdService : AccessibilityService() {
     private fun scan(pkg: String, activity: String?, force: Boolean) {
         if (pkg == packageName) return
         // 安装器在 SKIP_PKGS 里（扫广告没意义），只有开了安装拦截才放行。
-        if (SKIP_PKGS.contains(pkg) && !(extraInstall && INSTALLER_PKGS.contains(pkg))) return
+        if (isSkipPkg(pkg) && !(extraInstall && INSTALLER_PKGS.contains(pkg))) return
         val now = System.currentTimeMillis()
         if (scanning) {
             // content-changed 触发的重复扫描不记心跳，否则列表会被「被节流合并」刷满。
@@ -518,6 +560,7 @@ class SkipAdService : AccessibilityService() {
         var beatNote = ""
         var nodeCount = 0
         var candidateCount = 0
+        var treeMs = 0
         try {
             lastScanAt = now
             val root = rootInActiveWindow
@@ -552,12 +595,15 @@ class SkipAdService : AccessibilityService() {
                 beatNote = "安装器界面"
                 return
             }
-            if (realPkg == packageName || SKIP_PKGS.contains(realPkg)) {
+            if (realPkg == packageName || isSkipPkg(realPkg)) {
                 beatResult = BeatResult.SELF
                 beatNote = "窗口属于系统或本应用"
                 android.util.Log.i("SkipAd", "扫描跳过: 活动窗口=$realPkg 事件包名=$pkg force=$force")
+                scheduleLauncherRetry(pkg, realPkg, now)
                 return
             }
+            // 真的扫到了一个应用窗口：过渡期的补扫预算清零。
+            launcherRetryCount = 0
             if (realPkg != policyPkg || now - policyAt > 5000) {
                 currentPolicy = SkipPolicyStore.forPkg(this, realPkg)
                 policyPkg = realPkg
@@ -607,9 +653,12 @@ class SkipAdService : AccessibilityService() {
             scanScreenH = screen.height()
             val refs = ArrayList<Ref>(64)
             collect(root, refs, 0, screen, deadline, 0)
+            // 取树 + 遍历到此结束：这一段全是跨进程读节点属性，剩下的才是本地匹配。
+            treeMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
             android.util.Log.i(
                 "SkipAd",
-                "扫描 $realPkg 节点=${refs.size} 开屏窗=${windowAge}ms 策略=${policy.mode} force=$force",
+                "扫描 $realPkg 节点=${refs.size} 开屏窗=${windowAge}ms 策略=${policy.mode} " +
+                    "取树=${treeMs}ms force=$force",
             )
             nodeCount = refs.size
             // 附加动作（青少年弹窗 / 微信原图）默认全关，开关没开时一行退出、零开销。
@@ -702,9 +751,9 @@ class SkipAdService : AccessibilityService() {
                 beatNote = scanHitRule.orEmpty()
             }
             val costMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
-            // 空转退避的输入只有一个事实：这一轮有没有候选。
-            pacer.onScan(candidateCount)
-            beat(now, beatPkg, nodeCount, candidateCount, beatStage, beatResult, beatNote, costMs)
+            // 空转退避只认一个事实：这一轮有没有真的点下去。
+            pacer.onScan(scanHitRule != null, scanInSplash)
+            beat(now, beatPkg, nodeCount, candidateCount, beatStage, beatResult, beatNote, costMs, treeMs)
             // 扫描完成：把本次持有的所有节点引用一次性释放。
             // AccessibilityNodeInfo 是跨进程句柄，不能当普通对象缓存到下一轮。
             for (n in scanNodes) recycleNode(n)
@@ -723,6 +772,7 @@ class SkipAdService : AccessibilityService() {
         result: BeatResult,
         note: String,
         costMs: Int = 0,
+        treeMs: Int = 0,
     ) {
         // 切回自己时的那一轮没有任何信息量，界面里不出现，logcat 仍有窗口日志。
         if (result == BeatResult.SELF) return
@@ -737,6 +787,7 @@ class SkipAdService : AccessibilityService() {
                 result = result,
                 note = note,
                 costMs = costMs,
+                treeMs = treeMs,
             ),
         )
     }
@@ -1374,6 +1425,19 @@ class SkipAdService : AccessibilityService() {
         }
     }
 
+    /**
+     * 问系统「谁是桌面」。比硬编码包名列表可靠，也顺手覆盖了各家 OEM 的桌面。
+     * 解析失败时返回空表，退回静态名单，不影响任何功能。
+     */
+    private fun resolveHomePkgs(): List<String> = runCatching {
+        val pm = packageManager
+        val intent = android.content.Intent(android.content.Intent.ACTION_MAIN)
+            .addCategory(android.content.Intent.CATEGORY_HOME)
+        val all = pm.queryIntentActivities(intent, 0).mapNotNull { it.activityInfo?.packageName }
+        val def = pm.resolveActivity(intent, 0)?.activityInfo?.packageName
+        if (def != null) all + def else all
+    }.getOrDefault(emptyList())
+
     override fun onInterrupt() {}
 
     override fun onDestroy() {
@@ -1382,6 +1446,7 @@ class SkipAdService : AccessibilityService() {
         SkipAdState.onDisconnected(stateToken)
         // 授权还在、服务却断了 —— 多半是省电策略把服务冻住了。
         // 只提醒一次，不尝试后台重启（系统不允许），更不弹系统授权窗口。
+        handler.removeCallbacks(launcherRetry)
         ServiceRecovery.warnAccessibility(this)
         android.util.Log.i("SkipAd", "无障碍服务已断开")
         super.onDestroy()
@@ -1437,6 +1502,13 @@ class SkipAdService : AccessibilityService() {
          * 再长就会让「广告刚出现」的那一下明显变迟钝，不划算。
          */
         const val SCAN_MERGE_MAX_MS = 480L
+
+        /** 桌面还盖着目标应用时，隔多久补扫一次。 */
+        const val LAUNCHER_RETRY_DELAY_MS = 180L
+        /** 两次补扫的最小间隔，防止在桌面上刷屏。 */
+        const val LAUNCHER_RETRY_GAP_MS = 120L
+        /** 一次过渡最多补几次。 */
+        const val LAUNCHER_RETRY_MAX = 3
 
         /** 非强制扫描的最小间隔：开屏初期 60ms，其余保持 200ms。 */
         const val SCAN_GAP_MS = 200L
@@ -1497,11 +1569,11 @@ class SkipAdService : AccessibilityService() {
         /** 跳过提示最短间隔，同窗口连续命中不刷屏。 */
         const val TOAST_GAP_MS = 800L
 
-        /** 桌面：从桌面启动 App 是最典型的开屏场景，必须算「新会话」。 */
-        val LAUNCHER_PKGS = setOf(
-            "com.miui.home", "com.android.launcher", "com.android.launcher3",
-            "com.oppo.launcher", "com.huawei.android.launcher", "com.vivo.launcher",
-        )
+        /**
+         * 桌面：从桌面启动 App 是最典型的开屏场景，必须算「新会话」。
+         * 名单来自 [SystemPkgs]：静态兜底 + 运行时从 PackageManager 解析。
+         */
+        val LAUNCHER_PKGS = SystemPkgs.LAUNCHER
 
         /** 桌面 / 系统界面不可能有开屏广告，扫它们纯属浪费电。 */
         val SKIP_PKGS = LAUNCHER_PKGS + setOf(
@@ -1514,6 +1586,21 @@ class SkipAdService : AccessibilityService() {
             "com.baidu.input", "com.tencent.qqpinyin", "com.google.android.inputmethod.latin",
             "com.miui.inputmethod", "com.iflytek.inputmethod.miui",
         )
+
+        /**
+         * 扫描前的统一过滤：静态系统包 + 系统搜索入口 + ROM 自己报的桌面。
+         * 之前只看 [SKIP_PKGS]，于是 com.android.quicksearchbox 这类系统搜索
+         * 被当成普通应用反复扫 —— v1.4.0 真机一轮 99 次扫描里它占 49 次。
+         */
+        fun isSkipPkg(p: String?): Boolean {
+            if (p.isNullOrEmpty()) return true
+            return SKIP_PKGS.contains(p) || SystemPkgs.isSkip(p)
+        }
+
+        /** 服务连上时登记系统回答的桌面包名。 */
+        fun refreshLauncherPkgs(pkgs: Collection<String>) {
+            SystemPkgs.registerHome(pkgs)
+        }
     }
 }
 

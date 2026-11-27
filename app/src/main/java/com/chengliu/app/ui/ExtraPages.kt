@@ -617,9 +617,13 @@ private fun BeatRow(b: ScanBeat) {
                     append("候选 ${b.candidates}")
                 }
                 // 扫描耗时：这一轮在无障碍主线程上实际占用了多久。
+                // 拆成「取树 / 匹配」两段，才知道该省的是跨进程读节点还是本地比规则。
                 if (b.costMs > 0) {
                     if (isNotEmpty()) append(" · ")
                     append("耗时 ${b.costMs}ms")
+                    if (b.treeMs in 1 until b.costMs) {
+                        append("（取树 ${b.treeMs} · 匹配 ${b.costMs - b.treeMs}）")
+                    }
                 }
             }.ifEmpty { "未进入扫描" },
             fontSize = 10.sp,
