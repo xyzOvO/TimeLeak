@@ -48,6 +48,15 @@ class SkipAdService : AccessibilityService() {
     /** 规则解析单线程：几百 KB 的订阅不能在主线程解析，否则抬手就是 ANR。 */
     private val ruleLoader = java.util.concurrent.Executors.newSingleThreadExecutor()
 
+    /**
+     * 取树专用线程。`rootInActiveWindow` 与节点属性全是跨进程调用，单次 2~645ms，
+     * 必须离开无障碍主线程，否则事件处理和点击都被堵在队列后面。
+     * 单线程是有意的：同一时刻只让一棵树在被读。
+     */
+    private val scanWorker = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "SkipScan")
+    }
+
     private var curPkg: String? = null
     private var curAct: String? = null
 
@@ -57,6 +66,7 @@ class SkipAdService : AccessibilityService() {
     /** 前台应用切换时刻（给摇一摇判定用）。 */
     private var fgAt = 0L
     private var lastInteractAt = 0L
+    @Volatile
     private var lastScanAt = 0L
     private var lastGestureAt = 0L
     private var lastBackAt = 0L
@@ -73,6 +83,7 @@ class SkipAdService : AccessibilityService() {
 
     /** 本次窗口累计点击次数，封顶后不再折腾。 */
     private var sessionClicks = 0
+    @Volatile
     private var scanning = false
     private var lastCache = ""
     private var lastCustom = ""
@@ -111,11 +122,13 @@ class SkipAdService : AccessibilityService() {
     private var scanPopupRound = false
 
     /** 安全观察模式缓存值，由 syncEngine() 跟随配置热更新。 */
+    @Volatile
     private var observe = false
 
     /** 高级开关缓存：附加动作、圆形倒计时、手势兜底、跳过提示。每次事件同步一次。 */
     private var extraTeen = false
     private var extraWechat = false
+    @Volatile
     private var extraInstall = false
     /** 安装拦截测试模式：只放开安装拦截的 2 次上限，300ms 冷却与 600ms 扫描节流仍在。 */
     private var installTestMode = false
@@ -532,6 +545,15 @@ class SkipAdService : AccessibilityService() {
      *
      * 无论哪一轮命中，最后都要过 [click] 里的广告类型 + 应用策略闸门。
      */
+    /**
+     * 扫描入口（主线程）。这里只做闸门与节流，重活丢给 [scanWorker]。
+     *
+     * 为什么拆线程：真机实测一次 `rootInActiveWindow` + `collect` 要 2~645ms，全是跨进程
+     * 读属性。它原来跑在无障碍主线程上，把主线程堵住之后消息队列能堆到 3 秒
+     * （`PerfMonitor late=3016ms`）、本进程 `Skipped 114 frames`，点击因此被推迟——
+     * 「跳过广告慢」的真正原因在取树，不在规则匹配（匹配段实测 2~4ms）。
+     * 拆开之后：主线程仍独占全部点击与状态，取的只是换个线程读。
+     */
     private fun scan(pkg: String, activity: String?, force: Boolean) {
         if (pkg == packageName) return
         // 安装器在 SKIP_PKGS 里（扫广告没意义），只有开了安装拦截才放行。
@@ -546,60 +568,157 @@ class SkipAdService : AccessibilityService() {
         // 一次立即扫描，绝不能被上一个窗口留下的 lastScanAt 挡掉。
         if (!force && now - lastScanAt < scanGap(now)) return
         scanning = true
-        scanNodes.clear()
-        // 扫描耗时从进函数就开始算：真正卡住主线程的是这一整段，
-        // 只算匹配那一段会低估对外表现。
-        val startedAt = android.os.SystemClock.elapsedRealtime()
-        val deadline = android.os.SystemClock.elapsedRealtime() + SCAN_TIMEOUT_MS
-        scanDeadline = deadline
+        // 槽位在派活的那一刻就占住：worker 在跑的时候来的事件应该被上面那道闸挡掉，
+        // 而不是排队堆起来——堆起来的每一轮都是几百毫秒的跨进程读。
+        lastScanAt = now
         scanHitRule = null
+        val startedAt = android.os.SystemClock.elapsedRealtime()
+        scanDeadline = startedAt + SCAN_TIMEOUT_MS
+        try {
+            scanWorker.execute { readTree(pkg, activity, force, now, startedAt) }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            // 服务正在销毁（worker 已 shutdownNow）：把槽位放掉，别让扫描状态永久卡在 true。
+            scanning = false
+            android.util.Log.d("SkipAd", "扫描线程已关闭，跳过本次")
+        }
+    }
+
+    /** 一次扫描要用的节点树快照，跨线程传递用；纯数据，不持有节点。 */
+    private class TreeRead(
+        val pkg: String,
+        val activity: String?,
+        val force: Boolean,
+        val now: Long,
+        val startedAt: Long,
+        val treeMs: Int,
+        val realPkg: String,
+        val screen: Rect,
+        val refs: List<Ref>,
+        val abortResult: BeatResult?,
+        val abortNote: String,
+    )
+
+    /**
+     * 取树（worker 线程）：只读窗口内容，不碰任何点击状态。
+     *
+     * 系统窗口 / 本应用 / 策略关闭的窗口连 [collect] 都不做，结论照样交回主线程记心跳——
+     * 「银行类连窗口内容都不看」这条性质没有丢。
+     */
+    private fun readTree(pkg: String, activity: String?, force: Boolean, now: Long, startedAt: Long) {
+        val deadline = startedAt + SCAN_TIMEOUT_MS
+        scanNodes.clear()
+        var treeMs = 0
+        var realPkg = pkg
+        var screen = Rect(0, 0, 0, 0)
+        val refs = ArrayList<Ref>(64)
+        var abortResult: BeatResult? = null
+        var abortNote = ""
+        try {
+            val root = rootInActiveWindow
+            if (root == null) {
+                abortResult = BeatResult.NO_TREE
+                abortNote = "拿不到窗口内容"
+            } else {
+                // root 也是本次扫描的短期引用，主线程收尾时和其他节点一起释放。
+                scanNodes.add(root)
+                // 事件里的包名可能是上一个窗口的（切回本应用时尤其明显），以窗口根节点的包名为准
+                realPkg = root.packageName?.toString() ?: pkg
+                val dm = resources.displayMetrics
+                screen = Rect(0, 0, dm.widthPixels, dm.heightPixels)
+                when {
+                    realPkg == packageName || isSkipPkg(realPkg) -> {
+                        abortResult = BeatResult.SELF
+                        abortNote = "窗口属于系统或本应用"
+                    }
+                    INSTALLER_PKGS.contains(realPkg) -> {
+                        // 安装器窗口只跑安装弹窗拦截（还要接着匹配，所以取树）
+                        if (extraInstall && !observe) collect(root, refs, 0, screen, deadline, 0)
+                        else {
+                            abortResult = BeatResult.SELF
+                            abortNote = "安装器界面"
+                        }
+                    }
+                    // 银行 / 支付类：连窗口内容都不看，也不要留任何误点的可能。
+                    // 观察模式例外：只识别、只记录，依然不会执行任何点击。
+                    !observe && SkipPolicyStore.forPkg(this, realPkg).mode == PolicyMode.DISABLED -> {
+                        abortResult = BeatResult.POLICY
+                        abortNote = "应用策略为不自动点击"
+                    }
+                    else -> collect(root, refs, 0, screen, deadline, 0)
+                }
+                treeMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
+            }
+        } catch (t: Throwable) {
+            // 跨进程读节点随时会抛（窗口被销毁、句柄失效）。worker 线程不能因此死掉，
+            // 否则之后所有扫描都会静默失效——这类坑 Json5 那次已经踩过一次。
+            abortResult = BeatResult.NO_TREE
+            abortNote = "读节点树失败: ${t.javaClass.simpleName}"
+            treeMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
+        }
+        val read = TreeRead(
+            pkg = pkg,
+            activity = activity,
+            force = force,
+            now = now,
+            startedAt = startedAt,
+            treeMs = treeMs,
+            realPkg = realPkg,
+            screen = screen,
+            refs = refs,
+            abortResult = abortResult,
+            abortNote = abortNote,
+        )
+        val posted = handler.post { finishScan(read) }
+        if (!posted) {
+            // 主线程都排不上（服务正在销毁）：把句柄放掉，别泄漏。
+            for (n in scanNodes) recycleNode(n)
+            scanNodes.clear()
+            scanning = false
+        }
+    }
+
+    /** 扫描的第二段（主线程）：树已经取好，这里做策略、匹配、点击，并统一收尾。 */
+    private fun finishScan(t: TreeRead) {
+        val now = t.now
+        val realPkg = t.realPkg
+        val refs = t.refs
+        val screen = t.screen
+        val force = t.force
+        val startedAt = t.startedAt
+        val treeMs = t.treeMs
+        var beatPkg = realPkg
         // 心跳结论先按「扫完未命中」兜底，各分支只负责改写它。
-        var beatPkg = pkg
         var beatStage = BeatStage.NORMAL
         var beatResult = BeatResult.DONE
         var beatNote = ""
         var nodeCount = 0
         var candidateCount = 0
-        var treeMs = 0
+        val windowAge = now - windowAt
+        val inPoll = windowAge <= SPLASH_POLL_MS
+        if (t.abortResult != BeatResult.NO_TREE) {
+            beatStage = if (inPoll) BeatStage.SPLASH else BeatStage.POPUP
+        }
         try {
-            lastScanAt = now
-            val root = rootInActiveWindow
-            // root 也是本次扫描的短期引用，finally 里和所有子节点一起释放。
-            if (root != null) scanNodes.add(root)
-            if (root == null) {
-                beatResult = BeatResult.NO_TREE
-                beatNote = "拿不到窗口内容"
-                if (force) android.util.Log.d("SkipAd", "扫描 $pkg 跳过: 拿不到窗口内容")
+            if (t.abortResult != null) {
+                beatResult = t.abortResult
+                beatNote = t.abortNote
+                when (t.abortResult) {
+                    BeatResult.SELF -> {
+                        android.util.Log.i("SkipAd", "扫描跳过: 活动窗口=$realPkg 事件包名=${t.pkg} force=$force")
+                        scheduleLauncherRetry(t.pkg, realPkg, now)
+                    }
+                    BeatResult.NO_TREE -> if (force) android.util.Log.d("SkipAd", "扫描 ${t.pkg} 跳过: 拿不到窗口内容")
+                    BeatResult.POLICY -> if (force) android.util.Log.d("SkipAd", "扫描 $realPkg 跳过: 该应用策略为不自动点击")
+                    else -> {}
+                }
                 return
             }
-            val windowAge = now - windowAt
-            val inPoll = windowAge <= SPLASH_POLL_MS
-            // 事件里的包名可能是上一个窗口的（切回本应用时尤其明显），以窗口根节点的包名为准
-            val realPkg = root.packageName?.toString() ?: pkg
-            beatPkg = realPkg
-            beatStage = if (inPoll) BeatStage.SPLASH else BeatStage.POPUP
             // 安装器窗口：只跑安装弹窗拦截，不参与广告策略判定。
             if (INSTALLER_PKGS.contains(realPkg)) {
-                if (extraInstall && !observe) {
-                    val screen = Rect(
-                        0, 0,
-                        resources.displayMetrics.widthPixels,
-                        resources.displayMetrics.heightPixels,
-                    )
-                    val refs = ArrayList<Ref>(64)
-                    collect(root, refs, 0, screen, deadline, 0)
-                    android.util.Log.i("SkipAd", "安装器扫描 $realPkg 节点=${refs.size}")
-                    scanInstall(refs, screen, now, realPkg)
-                }
+                android.util.Log.i("SkipAd", "安装器扫描 $realPkg 节点=${refs.size}")
+                scanInstall(refs, screen, now, realPkg)
                 beatResult = BeatResult.SELF
                 beatNote = "安装器界面"
-                return
-            }
-            if (realPkg == packageName || isSkipPkg(realPkg)) {
-                beatResult = BeatResult.SELF
-                beatNote = "窗口属于系统或本应用"
-                android.util.Log.i("SkipAd", "扫描跳过: 活动窗口=$realPkg 事件包名=$pkg force=$force")
-                scheduleLauncherRetry(pkg, realPkg, now)
                 return
             }
             // 真的扫到了一个应用窗口：过渡期的补扫预算清零。
@@ -611,13 +730,8 @@ class SkipAdService : AccessibilityService() {
             }
             val policy = currentPolicy
             if (policy.mode == PolicyMode.DISABLED && !observe) {
-                // 银行 / 支付类：连窗口内容都不看，也不要留任何误点的可能。
-                // 观察模式例外：只识别、只记录，依然不会执行任何点击。
                 beatResult = BeatResult.POLICY
                 beatNote = "应用策略为不自动点击"
-                if (force) {
-                    android.util.Log.d("SkipAd", "扫描 $realPkg 跳过: 该应用策略为不自动点击")
-                }
                 return
             }
             scanPopupRound = !inPoll
@@ -643,18 +757,9 @@ class SkipAdService : AccessibilityService() {
             // 开屏场景按整个 12 秒窗口算（倒计时结束后才出现的按钮也属于开屏），
             // 但订阅 / 文本推断只在前 9 秒做，两者不能混为一谈。
             val inTextWindow = inPoll && windowAge <= SPLASH_TEXT_MS
-            val screen = Rect(
-                0, 0,
-                resources.displayMetrics.widthPixels,
-                resources.displayMetrics.heightPixels,
-            )
             scanInSplash = inPoll
             scanScreenW = screen.width()
             scanScreenH = screen.height()
-            val refs = ArrayList<Ref>(64)
-            collect(root, refs, 0, screen, deadline, 0)
-            // 取树 + 遍历到此结束：这一段全是跨进程读节点属性，剩下的才是本地匹配。
-            treeMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
             android.util.Log.i(
                 "SkipAd",
                 "扫描 $realPkg 节点=${refs.size} 开屏窗=${windowAge}ms 策略=${policy.mode} " +
@@ -735,7 +840,7 @@ class SkipAdService : AccessibilityService() {
                 if (SkipEngine.customHit(r.text, r.desc, r.id, r.cls) &&
                     click(r, now, HitReason.TEXT_GUESS)
                 ) return
-                when (SkipEngine.scopedHit(realPkg, activity, r.text, r.desc, r.id, windowAge, r.cls)) {
+                when (SkipEngine.scopedHit(realPkg, t.activity, r.text, r.desc, r.id, windowAge, r.cls)) {
                     SkipEngine.Action.CLICK -> if (click(r, now, HitReason.SUBSCRIPTION)) return
                     SkipEngine.Action.BACK -> if (doBack(now)) return
                     null -> {}
@@ -1447,6 +1552,7 @@ class SkipAdService : AccessibilityService() {
         // 授权还在、服务却断了 —— 多半是省电策略把服务冻住了。
         // 只提醒一次，不尝试后台重启（系统不允许），更不弹系统授权窗口。
         handler.removeCallbacks(launcherRetry)
+        scanWorker.shutdownNow()
         ServiceRecovery.warnAccessibility(this)
         android.util.Log.i("SkipAd", "无障碍服务已断开")
         super.onDestroy()
