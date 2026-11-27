@@ -43,6 +43,14 @@ data class ScanBeat(
     val stage: BeatStage,
     val result: BeatResult,
     val note: String,
+    /**
+     * 这一轮扫描本身花了多少毫秒（取树 + 匹配，不含点击）。
+     *
+     * 加它是因为「跳过变快了」不能靠感觉断言：扫描跑在主线程上，
+     * 这个数字直接就是一次内容变化事件带来的卡顿时长。默认 0 表示
+     * 这条心跳不是一次真实扫描（比如被节流、没扫就退出）。
+     */
+    val costMs: Int = 0,
 )
 
 object ScanLog {

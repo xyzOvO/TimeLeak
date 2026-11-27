@@ -12,6 +12,9 @@ package com.chengliu.app.core
  */
 object Json5 {
 
+    /** 嵌套层数上限：正常订阅最深也就十来层，超了就是畸形数据。 */
+    private const val MAX_DEPTH = 64
+
     /**
      * 解析失败返回 null。
      *
@@ -60,9 +63,12 @@ object Json5 {
 
         private fun readObject(): Map<String, Any?> {
             val map = LinkedHashMap<String, Any?>()
-            if (++depth > 64) { depth--; return map }
+            // 嵌套过深直接认输，不能「返回一个空 Map 就撒手」：调用方的 while 循环
+            // 会因为 i 原地不动而永远转下去（见下方 before 的注释）。
+            if (++depth > MAX_DEPTH) { depth--; throw IllegalStateException("嵌套过深") }
             i++ // 跳过 {
             while (i < s.length) {
+                val before = i
                 skip()
                 if (i >= s.length) break
                 val c = s[i]
@@ -75,6 +81,10 @@ object Json5 {
                 if (key.isNotEmpty()) map[key] = v
                 skip()
                 if (i < s.length && s[i] == ',') i++
+                // 畸形输入（多余的 ]、被截断的下载、手抖的半个引号）会让这一轮
+                // 既没读到 key 也没读到 value，i 一步没动。以前这里就这么原地转下去，
+                // 整条解析线程永久卡死；现在强制往前推一格，宁可丢掉一个字符也要退出。
+                if (i == before) i++
             }
             depth--
             return map
@@ -82,9 +92,10 @@ object Json5 {
 
         private fun readArray(): List<Any?> {
             val list = ArrayList<Any?>()
-            if (++depth > 64) { depth--; return list }
+            if (++depth > MAX_DEPTH) { depth--; throw IllegalStateException("嵌套过深") }
             i++ // 跳过 [
             while (i < s.length) {
+                val before = i
                 skip()
                 if (i >= s.length) break
                 val c = s[i]
@@ -93,6 +104,7 @@ object Json5 {
                 list.add(readValue())
                 skip()
                 if (i < s.length && s[i] == ',') i++
+                if (i == before) i++
             }
             depth--
             return list

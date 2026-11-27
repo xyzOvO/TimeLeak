@@ -616,6 +616,11 @@ private fun BeatRow(b: ScanBeat) {
                     if (isNotEmpty()) append(" · ")
                     append("候选 ${b.candidates}")
                 }
+                // 扫描耗时：这一轮在无障碍主线程上实际占用了多久。
+                if (b.costMs > 0) {
+                    if (isNotEmpty()) append(" · ")
+                    append("耗时 ${b.costMs}ms")
+                }
             }.ifEmpty { "未进入扫描" },
             fontSize = 10.sp,
             color = ui.sub,

@@ -142,6 +142,12 @@ class SkipAdService : AccessibilityService() {
     /** 本轮扫描命中的规则名；扫描结束时用它把心跳结论标成「命中」。 */
     private var scanHitRule: String? = null
 
+    /**
+     * 空转退避：连续几轮扫不到任何候选，就把内容变化事件的合并窗口拉长。
+     * 逻辑全在 [ScanPacer] 里（纯函数、可单测），这里只负责喂结果。
+     */
+    private val pacer = ScanPacer(SCAN_MERGE_MS, SCAN_MERGE_MS, SCAN_MERGE_MAX_MS)
+
     /** 应用名缓存：心跳每条都要显示应用名，不能每次都问 PackageManager。 */
     private val labelCache = HashMap<String, String>()
 
@@ -285,7 +291,11 @@ class SkipAdService : AccessibilityService() {
             AccessibilityEvent.TYPE_VIEW_CLICKED,
             AccessibilityEvent.TYPE_VIEW_LONG_CLICKED,
             AccessibilityEvent.TYPE_VIEW_SCROLLED,
-            -> lastInteractAt = now
+            -> {
+                lastInteractAt = now
+                // 用户自己在动，画面随时可能翻页，退避立刻归零。
+                pacer.reset()
+            }
 
             AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
                 val pkg = e.packageName?.toString() ?: return
@@ -320,7 +330,8 @@ class SkipAdService : AccessibilityService() {
                 pendingScanPkg = pkg
                 handler.removeCallbacks(pendingScan)
                 // 开屏初期首个事件立即扫，不再白等一整个合并窗口。
-                val mergeMs = if (inFastWindow(now)) SCAN_MERGE_FAST_MS else SCAN_MERGE_MS
+                // 其余情况用空转退避：连续扫不到候选时，窗口从 120ms 逐级拉到 480ms。
+                val mergeMs = if (inFastWindow(now)) SCAN_MERGE_FAST_MS else pacer.mergeDelayMs
                 handler.postDelayed(pendingScan, mergeMs)
             }
 
@@ -331,6 +342,8 @@ class SkipAdService : AccessibilityService() {
 
     /** 处理一次「前台换成了 pkg/act」，窗口事件与内容变化事件共用。 */
     private fun handleWindow(pkg: String, act: String, now: Long) {
+        // 换窗口 = 新页面开局，空转退避清零，开屏窗必须立刻扫。
+        pacer.reset()
         val from = curPkg
         val fromOther = from == null || from != pkg
         if (from != null && from != pkg) {
@@ -492,6 +505,9 @@ class SkipAdService : AccessibilityService() {
         if (!force && now - lastScanAt < scanGap(now)) return
         scanning = true
         scanNodes.clear()
+        // 扫描耗时从进函数就开始算：真正卡住主线程的是这一整段，
+        // 只算匹配那一段会低估对外表现。
+        val startedAt = android.os.SystemClock.elapsedRealtime()
         val deadline = android.os.SystemClock.elapsedRealtime() + SCAN_TIMEOUT_MS
         scanDeadline = deadline
         scanHitRule = null
@@ -685,7 +701,10 @@ class SkipAdService : AccessibilityService() {
                 beatResult = BeatResult.HIT
                 beatNote = scanHitRule.orEmpty()
             }
-            beat(now, beatPkg, nodeCount, candidateCount, beatStage, beatResult, beatNote)
+            val costMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
+            // 空转退避的输入只有一个事实：这一轮有没有候选。
+            pacer.onScan(candidateCount)
+            beat(now, beatPkg, nodeCount, candidateCount, beatStage, beatResult, beatNote, costMs)
             // 扫描完成：把本次持有的所有节点引用一次性释放。
             // AccessibilityNodeInfo 是跨进程句柄，不能当普通对象缓存到下一轮。
             for (n in scanNodes) recycleNode(n)
@@ -703,6 +722,7 @@ class SkipAdService : AccessibilityService() {
         stage: BeatStage,
         result: BeatResult,
         note: String,
+        costMs: Int = 0,
     ) {
         // 切回自己时的那一轮没有任何信息量，界面里不出现，logcat 仍有窗口日志。
         if (result == BeatResult.SELF) return
@@ -716,6 +736,7 @@ class SkipAdService : AccessibilityService() {
                 stage = stage,
                 result = result,
                 note = note,
+                costMs = costMs,
             ),
         )
     }
@@ -973,7 +994,9 @@ class SkipAdService : AccessibilityService() {
         val text = node.text?.toString()?.trim().orEmpty()
         val desc = node.contentDescription?.toString()?.trim().orEmpty()
         val id = node.viewIdResourceName ?: ""
-        val cls = node.className?.toString()?.trim().orEmpty()
+        // className 每读一次就是一次跨进程调用，一屏几百个节点下来很可观；
+        // 而只有订阅里写了 [name="..."] 时才会有人用它，所以按需读。
+        val cls = if (SkipEngine.needsClass) node.className?.toString()?.trim().orEmpty() else ""
         val clickable = node.isClickable
         val rect = Rect()
         node.getBoundsInScreen(rect)
@@ -1408,6 +1431,12 @@ class SkipAdService : AccessibilityService() {
 
         /** 开屏初期按钮刚渲染，首个事件立即扫描，不额外等待合并窗口。 */
         const val SCAN_MERGE_FAST_MS = 0L
+
+        /**
+         * 空转退避的上限：连续扫不到候选时，合并窗口最多拉长到这里。
+         * 再长就会让「广告刚出现」的那一下明显变迟钝，不划算。
+         */
+        const val SCAN_MERGE_MAX_MS = 480L
 
         /** 非强制扫描的最小间隔：开屏初期 60ms，其余保持 200ms。 */
         const val SCAN_GAP_MS = 200L

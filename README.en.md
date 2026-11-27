@@ -55,6 +55,8 @@ Two steps after install, or features won't work:
 | **Pre-click re-verification** | Right before acting, the node is re-read: still present, still visible, bounds not drifted (±16px), text unchanged, window still owned by the same app — any mismatch aborts the click and records why |
 | **Per-app policy** | Presets plus per-package overrides, see below |
 | **Shake landing-page rollback** | Without root we can't block sensors; we only roll back "jumped to browser/store/shop" landing pages, max once per target / 10s |
+| **Idle backoff** | After several rounds with no candidate, the event-merge window widens from 120ms up to 480ms; any candidate or window change pulls it back at once, so CPU isn't burned on screens without ads |
+| **Visible scan cost** | Every "scan heartbeat" entry records how long that scan took (ms), so it's obvious whether a speed-up actually helped |
 
 Per-app policies are edited on the "Skip Ads" and "App rules" pages; **explicit user settings win over presets and auto-classification**:
 
@@ -148,7 +150,7 @@ Ad skipping moved from "keyword hit = click" to **multi-condition scoring**: ad-
 
 **Safe observation mode** (a core feature) recognizes rules without clicking or pressing Back. Each record shows the current app, text, id, clickability, rule, verdict, score, ad type, action and scoring reasons; switch back to auto-execution once the rules look right. Observation records live **in memory only**, vanish on process exit, and are never persisted, backed up or uploaded.
 
-The page also keeps a **scan heartbeat**: every scan leaves one line (app, node count, candidate count, window phase, verdict) whether or not anything matched. When the record list is empty it tells you which of the cases you hit — no node tree, empty tree, no candidates, merged because you switched apps too fast, or blocked by policy — without attaching a PC to read logcat. Heartbeats are memory-only too, capped at 40, and store structural data only, never on-screen text.
+The page also keeps a **scan heartbeat**: every scan leaves one line (app, node count, candidate count, window phase, verdict) whether or not anything matched. When the record list is empty it tells you which of the cases you hit — no node tree, empty tree, no candidates, merged because you switched apps too fast, or blocked by policy — without attaching a PC to read logcat. Heartbeats are memory-only too, capped at 40, and store structural data plus how long the scan took, never on-screen text.
 
 A successful click starts a **2-second cooldown**: no second target in the same window, re-evaluated only after a window change. Node-tree scanning filters irrelevant events, merges content changes within 120ms, scans only on window/content changes, and caps depth 12 / candidates 300 / visited 400 / 120ms timeout with a short-lived plain-data snapshot. `AccessibilityNodeInfo` instances are released together at the end of each scan and never cached across scans.
 
@@ -162,9 +164,19 @@ python tools/regression/run.py
 
 It compiles `DecisionModel.kt` + `DecisionCore.kt` (the very same decision core used at runtime) together with typical node-tree samples from `tools/regression/samples.json` into JVM bytecode using the Kotlin compiler in the Gradle cache. It asserts correct hits, no false hits on normal buttons, no duplicate clicks, no action after page switches, correct clicks after countdowns, and no cross-app side effects. The report goes to `tools/regression/report.txt`; a failure returns a non-zero exit code.
 
+The matching layer (`SkipEngine`) has its own **timing benchmark**, also PC-only:
+
+```bash
+powershell -ExecutionPolicy Bypass -File tools/bench/run-bench.ps1   # tools/bench/run-bench.sh in bash
+```
+
+It runs the real `SkipEngine` over a fixed sample of 300 nodes × 340 rules in 45 groups, reporting medians for `safety check / built-in fingerprints / subscription matching` plus microseconds per node. Run it after touching matching code to see whether the cost actually dropped or merely moved.
+
 ### 🔐 Subscription safety & privacy audit
 
 **Public subscriptions are never trusted unconditionally.** Every update goes through: source allowlist (new sources need explicit user confirmation) → SHA-256 fingerprint → diff preview (added/removed counts and samples) → anomaly checks → user confirmation → one-tap rollback to the previous version. Blocking anomalies include script fragments, `file://` references, over-long lines, empty rule sets, a sudden surge of allow rules, and a >50% rule-count drop; such updates never become active automatically. GKD and DNS lists share the same gateway.
+
+The parser itself assumes it is fed bad data: a malformed or half-downloaded subscription could previously send the parse loop spinning in place and occupy the single hot-reload thread forever, silently killing every later rule update. Loops now always advance, nesting beyond 64 levels is abandoned outright, and the worst case is "this subscription didn't load".
 
 The Privacy Audit page lists every local storage item, every network endpoint, the permission list, DNS encryption state and VPN traffic scope; it offers config backup/restore (plain JSON, configuration and lists only), one-tap runtime-data clearing, full local-data clearing (with confirmation) and subscription integrity checks. Backups exclude subscription bodies, block logs, observation records and statistics.
 
@@ -234,6 +246,8 @@ A: The app's scope is lightweight filtering + splash skipping. DNS-only already 
 - **DNS-only VpnService**: a `10.225.0.1` tunnel with virtual DNS `10.225.0.2`; system DNS is redirected locally, matched by domain suffix, the rest resolved normally. Virtual DNS and tunnel must be on different addresses or the local route table creates a `scope host` shortcut.
 - **Leak protection**: 23 public DNS servers added as `/32` to the tunnel route; non-virtual-DNS 53 packets taken over, 443 / 853 dropped. DoH must build its own socket (`Socket → bind → protect → connect`) for SNI + cert validation; one wrong step and "DoH times out → whole network loses resolution".
 - **Splash skipping**: the accessibility service watches window events and actively polls windows for ~12s after an external entry; scanning goes in three rounds — ad-SDK resource names → user coordinates → text whitelist. At most 2 clicks per window and only the same control, text only on narrow + short controls, plus a CTA / deny-word blacklist to avoid misfires.
+- **Matching cost**: selector values are lowercased and regexes compiled once at load time; during a scan each node's text is lowercased once and reused across hundreds of rules (previously every clause lowered it again, and `contains(ignoreCase = true)` folds case position by position). When the subscription contains no `[name=]` selector, `className` isn't even read, saving one cross-process call per node. On the benchmark sample, match time went from 83.7µs to 17.1µs per node.
+- **Battery**: DNS counters no longer push a UI refresh for every packet — at most one per 250ms plus a trailing emit (no value lost, UI at most 250ms behind), and the date check runs at most once a second; on the scan side, the merge window backs off to 480ms while idle. The DNS read loop blocks in `poll` instead of busy-waiting.
 
 ---
 

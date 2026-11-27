@@ -30,32 +30,83 @@ object SkipEngine {
     enum class Action { CLICK, BACK }
 
     data class Clause(val target: Target, val op: Op, val value: String) {
-        fun matches(v: String): Boolean {
+        /**
+         * 匹配用的值（小写形式），装载时算一次。
+         * 忽略大小写的比较统一改成「两边都小写再比」—— 见 [matchesLow]。
+         */
+        private val low: String by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            if (op == Op.REGEX) "" else value.lowercase()
+        }
+
+        /**
+         * 正则只编译一次。
+         *
+         * 以前是每次匹配都 `Regex(value, IGNORE_CASE)` 现编现用：一条 `~=` 子句
+         * 在一次扫描里会被几百个节点各撞一次，编译开销比匹配本身还大一个量级以上。
+         * 编译失败（畸形正则）缓存成 null，语义等同「永不命中」，和原来的
+         * runCatching{}.getOrDefault(false) 一致。
+         */
+        private val regex: Regex? by lazy(LazyThreadSafetyMode.PUBLICATION) {
+            if (op != Op.REGEX) null
+            else runCatching { Regex(value, RegexOption.IGNORE_CASE) }.getOrNull()
+        }
+
+        /**
+         * 匹配一个**已经小写**的输入。
+         *
+         * 为什么专门要这么一条路径：一次扫描会对几百个节点各跑几百条子句，
+         * `String.contains(other, ignoreCase = true)` 是逐位置做带大小写折叠的
+         * 区域比较，比自己比小写串的 `contains` 慢一个量级。大小写无关的语义
+         * 用 `lowercase()` 表达，对中文与 ASCII 文案完全等价（Kotlin 的
+         * `lowercase()` 走 Locale.ROOT，没有土耳其 i 的坑）。
+         */
+        fun matchesLow(v: String): Boolean {
             if (v.isEmpty()) return false
             return when (op) {
-                Op.EQ -> v.equals(value, true)
-                Op.CONTAINS -> v.contains(value, true)
-                Op.PREFIX -> v.startsWith(value, true)
-                Op.SUFFIX -> v.endsWith(value, true)
-                Op.REGEX -> runCatching {
-                    Regex(value, RegexOption.IGNORE_CASE).containsMatchIn(v)
-                }.getOrDefault(false)
+                Op.EQ -> v == low
+                Op.CONTAINS -> v.contains(low)
+                Op.PREFIX -> v.startsWith(low)
+                Op.SUFFIX -> v.endsWith(low)
+                Op.REGEX -> regex?.containsMatchIn(v) ?: false
             }
+        }
+
+        /** 未小写的输入：内部转一次小写再走 [matchesLow]。 */
+        fun matches(v: String): Boolean {
+            if (v.isEmpty()) return false
+            return matchesLow(v.lowercase())
         }
     }
 
     /** 一个规格 = 多个「或」分支，每个分支内是「且」条件。 */
     data class Spec(val alts: List<List<Clause>>) {
-        fun hit(text: String, desc: String, id: String, cls: String = ""): Boolean = alts.any { alt ->
-            alt.isNotEmpty() && alt.all { c ->
-                when (c.target) {
-                    Target.TEXT -> c.matches(text)
-                    Target.DESC -> c.matches(desc)
-                    // GKD 的 vid 是 "tv_skip"，系统给的是 "com.xx:id/tv_skip"，只比最后一段
-                    Target.ID -> c.matches(id.substringAfterLast('/').substringAfterLast(':')) ||
-                        c.matches(id)
-                    Target.CLASS -> c.matches(cls)
-                    Target.ANY -> c.matches(text) || c.matches(desc) || c.matches(id)
+        fun hit(text: String, desc: String, id: String, cls: String = ""): Boolean = hitLow(
+            text.lowercase(), desc.lowercase(), id.lowercase(), cls.lowercase(),
+        )
+
+        /**
+         * 四个入参都必须是**已经小写**的字符串。
+         * 扫描时调用方先把节点文本转一次小写，再对所有规则复用，省掉
+         * 「每条款子各转一次大小写」这笔大头开销。
+         */
+        fun hitLow(text: String, desc: String, id: String, cls: String): Boolean {
+            // id 的短名（最后一段、去掉 : 后缀）每个 Spec 只算一次：
+            // 以前每条 ID 子句都 substringAfterLast 两遍，纯属白造对象。
+            var shortId: String? = null
+            return alts.any { alt ->
+                alt.isNotEmpty() && alt.all { c ->
+                    when (c.target) {
+                        Target.TEXT -> c.matchesLow(text)
+                        Target.DESC -> c.matchesLow(desc)
+                        // GKD 的 vid 是 "tv_skip"，系统给的是 "com.xx:id/tv_skip"，只比最后一段
+                        Target.ID -> {
+                            val s = shortId
+                                ?: id.substringAfterLast('/').substringAfterLast(':').also { shortId = it }
+                            c.matchesLow(s) || c.matchesLow(id)
+                        }
+                        Target.CLASS -> c.matchesLow(cls)
+                        Target.ANY -> c.matchesLow(text) || c.matchesLow(desc) || c.matchesLow(id)
+                    }
                 }
             }
         }
@@ -120,6 +171,32 @@ object SkipEngine {
     private var loadedKey = Int.MIN_VALUE
 
     /**
+     * 当前规则集里是否存在依赖 class 名的选择器（GKD 的 `[name="..."]`）。
+     *
+     * 实际订阅里几乎没人写，那就不该为每个节点去读一次 `className` ——
+     * 那是每节点一次跨进程调用，一屏几百个节点时是整轮扫描里最贵的一笔，
+     * 而读回来的字符串 99% 的时间没人用。
+     */
+    @Volatile
+    var needsClass: Boolean = false
+        private set
+
+    private fun specsUseClass(list: List<Spec>): Boolean =
+        list.any { sp -> sp.alts.any { alt -> alt.any { it.target == Target.CLASS } } }
+
+    private fun anyClassClause(s: Snapshot): Boolean {
+        if (specsUseClass(s.keywords)) return true
+        for (p in s.popups) {
+            if (specsUseClass(listOf(p.trigger))) return true
+            val a = p.action ?: continue
+            if (specsUseClass(listOf(a))) return true
+        }
+        return s.groups.any { g ->
+            g.rules.any { r -> specsUseClass(r.specs) || specsUseClass(r.excludes) }
+        }
+    }
+
+    /**
      * 订阅缓存或自定义规则变化时重新解析。
      * 用 hashCode 做变更检测，避免每次无障碍事件都重新解析几百 KB 文本。
      * 可以放心在 UI 线程之外调用；同一个 key 重复调用会直接返回。
@@ -137,7 +214,10 @@ object SkipEngine {
                 "解析明细: apps=${b.apps} 原始组=${b.groupsRaw} 可用组=${b.groups.size} " +
                     "原始规则=${b.ruleRaw} 可用规则=${b.rules}",
             )
-            snap = Snapshot(b.groups, b.keywords, b.bounds, b.popups, b.rules)
+            val snapshot = Snapshot(b.groups, b.keywords, b.bounds, b.popups, b.rules)
+            // 先立标记再换快照，读侧看到新快照时标记一定已经就位。
+            needsClass = anyClassClause(snapshot)
+            snap = snapshot
             loadedKey = key
         }
     }
@@ -187,6 +267,9 @@ object SkipEngine {
 
     private val ID_SKIP = Regex("(^|[_-])(skip|skipad|adskip|splashskip|tvskip|btnskip)($|[_-])")
 
+    /** `skip3`、`skip 5` 这类带数字的英文跳过键，提成常量，别再每次调用现编正则。 */
+    private val SKIP_NUM = Regex("^skip\\s*\\d")
+
     fun builtinHit(text: String, desc: String, id: String): Boolean {
         if (!builtin) return false
         for (raw in arrayOf(text, desc)) {
@@ -209,7 +292,7 @@ object SkipEngine {
 
     private fun enSkip(low: String): Boolean =
         low == "skip" || low.startsWith("skip ") || low.startsWith("skip|") ||
-            low.endsWith(" skip") || Regex("^skip\\s*\\d").containsMatchIn(low)
+            low.endsWith(" skip") || SKIP_NUM.containsMatchIn(low)
 
     // ---------------- 订阅 / 自定义 规则命中 ----------------
 
@@ -230,6 +313,11 @@ object SkipEngine {
         val list = groupsFor(pkg)
         if (list.isEmpty()) return null
         val act = activity?.substringAfterLast('.') ?: ""
+        // 大小写只转一次，往下所有规则复用这四份小写串
+        val lt = text.lowercase()
+        val ld = desc.lowercase()
+        val li = id.lowercase()
+        val lc = cls.lowercase()
         for (g in list) {
             // 订阅里的 matchTime 可以写得很大（有的写 60 秒），必须再夹一道：
             // 开屏只发生在前十几秒，超出的时间窗只会让服务在正文里继续点。
@@ -245,8 +333,8 @@ object SkipEngine {
                 if (r.activityIds.isNotEmpty() &&
                     (act.isEmpty() || r.activityIds.none { it.equals(act, true) })
                 ) continue
-                if (r.excludes.any { it.hit(text, desc, id, cls) }) continue
-                if (r.specs.any { it.hit(text, desc, id, cls) }) return r.action
+                if (r.excludes.any { it.hitLow(lt, ld, li, lc) }) continue
+                if (r.specs.any { it.hitLow(lt, ld, li, lc) }) return r.action
             }
         }
         return null
@@ -265,12 +353,17 @@ object SkipEngine {
         cls: String = "",
     ): Boolean {
         if (windowAgeMs > GLOBAL_MAX_MS) return false
+        // 时间窗已经过了就别再转小写（省两次分配）
+        val lt = text.lowercase()
+        val ld = desc.lowercase()
+        val li = id.lowercase()
+        val lc = cls.lowercase()
         for (g in snap.groups) {
             if (g.pkg != null) continue
             if (windowAgeMs > minOf(g.matchTimeMs, GLOBAL_MAX_MS)) continue
             for (r in g.rules) {
-                if (r.excludes.any { it.hit(text, desc, id, cls) }) continue
-                if (r.specs.any { it.hit(text, desc, id, cls) }) return true
+                if (r.excludes.any { it.hitLow(lt, ld, li, lc) }) continue
+                if (r.specs.any { it.hitLow(lt, ld, li, lc) }) return true
             }
         }
         return false
@@ -334,8 +427,15 @@ object SkipEngine {
     )
 
     /** 自定义 keywords 规则（全局，仅开屏窗口生效）。 */
-    fun customHit(text: String, desc: String, id: String, cls: String = ""): Boolean =
-        snap.keywords.any { it.hit(text, desc, id, cls) }
+    fun customHit(text: String, desc: String, id: String, cls: String = ""): Boolean {
+        val list = snap.keywords
+        if (list.isEmpty()) return false
+        val lt = text.lowercase()
+        val ld = desc.lowercase()
+        val li = id.lowercase()
+        val lc = cls.lowercase()
+        return list.any { it.hitLow(lt, ld, li, lc) }
+    }
 
     // ---------------- 广告类型识别 ----------------
 
