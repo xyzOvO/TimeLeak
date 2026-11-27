@@ -79,6 +79,7 @@ import com.chengliu.app.core.Counters
 import com.chengliu.app.core.Privacy
 import com.chengliu.app.core.PrivateDns
 import com.chengliu.app.core.RuleParser
+import com.chengliu.app.core.GuessTargets
 import com.chengliu.app.core.SkipEngine
 import com.chengliu.app.core.SkipSources
 import com.chengliu.app.core.SubGuard
@@ -1751,6 +1752,7 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     var guessApps by remember { mutableStateOf(prefs.guessApps) }
     var showAddGuess by remember { mutableStateOf(false) }
     var guessQuery by remember { mutableStateOf("") }
+    var guessError by remember { mutableStateOf("") }
     var roundCountdown by remember { mutableStateOf(prefs.roundCountdown) }
     var skipToast by remember { mutableStateOf(prefs.skipToast) }
     var toastText by remember { mutableStateOf(prefs.skipToastText) }
@@ -1802,8 +1804,11 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
         }.onFailure { message = "导入失败：${it.message}" }
     }
 
-    LaunchedEffect(showAddPolicy) {
-        if (!showAddPolicy) return@LaunchedEffect
+    LaunchedEffect(showAddPolicy, showAddGuess) {
+        // 猜测白名单对话框和「添加应用」共用这份已装应用清单。
+        // 原来只监听 showAddPolicy：从白名单点进来时清单是空的，搜索框怎么打都搜不到东西。
+        if (!showAddPolicy && !showAddGuess) return@LaunchedEffect
+        if (installedApps.isNotEmpty()) return@LaunchedEffect
         installedApps = withContext(Dispatchers.Default) {
             val pm = ctx.packageManager
             // Android 11+ 的 getInstalledApplications 受包可见性限制，只会返回
@@ -2057,11 +2062,15 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
                         value = guessQuery,
-                        onValueChange = { guessQuery = it },
+                        onValueChange = { guessQuery = it; guessError = "" },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("搜索应用名，或直接填包名") },
+                        isError = guessError.isNotEmpty(),
                     )
+                    if (guessError.isNotEmpty()) {
+                        Text(guessError, fontSize = 11.sp, color = ui.warn)
+                    }
                     Spacer(Modifier.height(8.dp))
                     Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
                         candidates.forEach { (p, label) ->
@@ -2085,13 +2094,20 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
             },
             confirmButton = {
                 TextButton(onClick = {
-                    val p = guessQuery.trim()
-                    if (p.contains('.') && p.length > 3) {
-                        prefs.addGuessApp(p)
+                    // 三种输入都认：点列表里那行、填完整包名、填到只剩唯一匹配的名字。
+                    val typed = GuessTargets.normalizePkg(guessQuery)
+                    val pick = typed
+                        ?: candidates.singleOrNull()?.first
+                        ?: candidates.firstOrNull { it.first.equals(guessQuery.trim(), true) }?.first
+                    if (pick != null) {
+                        prefs.addGuessApp(pick)
                         guessApps = prefs.guessApps
+                        guessQuery = ""
+                        guessError = ""
                         showAddGuess = false
                     } else {
-                        message = "请输入完整包名，例如 com.example.app"
+                        // 错误必须显示在对话框里：以前写页面级 message，对话框盖着看不见，像按钮没反应
+                        guessError = "填完整包名，像 com.example.app；也可以直接点上面搜到的应用"
                     }
                 }) { Text("按包名放行", color = ui.accent) }
             },

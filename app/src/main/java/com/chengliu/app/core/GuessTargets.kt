@@ -27,4 +27,17 @@ object GuessTargets {
 
     /** 大胆档不拿广告话术当前置证据：名单是用户自己放行的，直接交给闸门去判。 */
     fun needsAdEvidence(mode: Mode): Boolean = mode != Mode.BOLD
+
+    /**
+     * 把输入框里的东西规整成包名；不像包名就返回 null。
+     *
+     * 为什么要校验：白名单是按包名精确比对的，用户手输「com」或「com.」这种半截字符串时，
+     * 存进去既匹配不到任何应用，也会让「按包名放行」看起来像没反应——真机上就是这么被当成按钮失灵的。
+     */
+    fun normalizePkg(raw: String): String? {
+        val s = raw.trim().lowercase()
+        if (s.length < 4 || !s.contains('.')) return null
+        if (!s.matches(Regex("^[a-z][a-z0-9_]*(\\.[a-z0-9_]+)+$"))) return null
+        return s
+    }
 }

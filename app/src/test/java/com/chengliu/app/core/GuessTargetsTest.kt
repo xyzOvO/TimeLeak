@@ -2,6 +2,7 @@ package com.chengliu.app.core
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -29,6 +30,23 @@ class GuessTargetsTest {
     fun boldGetsTwoTriesAndOffGetsOne() {
         assertEquals(2, GuessTargets.maxTries(GuessTargets.Mode.BOLD))
         assertEquals(1, GuessTargets.maxTries(GuessTargets.Mode.OFF))
+    }
+
+    @Test
+    fun normalizePkgAcceptsRealPackageNames() {
+        assertEquals("com.example.app", GuessTargets.normalizePkg("  COM.Example.App "))
+        assertEquals("io.github.demo_1.tool", GuessTargets.normalizePkg("io.github.demo_1.tool"))
+    }
+
+    @Test
+    fun normalizePkgRejectsHalfTypedInput() {
+        // 真机上用户输「com」就点「按包名放行」，以前会静默失败，看着像按钮坏了
+        assertNull(GuessTargets.normalizePkg("com"))
+        assertNull(GuessTargets.normalizePkg("com."))
+        assertNull(GuessTargets.normalizePkg("com..app"))
+        assertNull(GuessTargets.normalizePkg(""))
+        assertNull(GuessTargets.normalizePkg("1com.example.app"))
+        assertNull(GuessTargets.normalizePkg("com.example app"))
     }
 
     @Test
