@@ -1723,6 +1723,7 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     var showAdvanced by remember { mutableStateOf(false) }
     var gestureFallback by remember { mutableStateOf(prefs.gestureFallback) }
     var fastPath by remember { mutableStateOf(prefs.skipFastPath) }
+    var geoTap by remember { mutableStateOf(prefs.skipGeoTap) }
     var roundCountdown by remember { mutableStateOf(prefs.roundCountdown) }
     var skipToast by remember { mutableStateOf(prefs.skipToast) }
     var toastText by remember { mutableStateOf(prefs.skipToastText) }
@@ -2572,6 +2573,14 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                     "取到的仍是真节点，判定与二次验证一步不少。异常时关掉即回到完整扫描",
                 fastPath,
             ) { fastPath = it; prefs.skipFastPath = it }
+            ToggleLine(
+                "猜无文字跳过按钮",
+                "有的广告把「跳过」直接画在画面上，控件里既没有文字也没有 id；开启后，" +
+                    "在所有文案规则都没点到的开屏广告上，会试着点一次「贴在角落、个头很小、" +
+                    "自身可点」的控件（每次打开最多猜一次，仍走完整判定与点击后复核）。" +
+                    "这是猜测，误点风险比其它识别方式高，觉得点错东西就把它关掉",
+                geoTap,
+            ) { geoTap = it; prefs.skipGeoTap = it }
             ToggleLine(
                 "识别圆形倒计时按钮",
                 "开屏角落只有「3」「3s」的圆形跳过按钮，按内置强信号识别；不是自绘坐标点击",

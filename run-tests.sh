@@ -57,6 +57,7 @@ TEST_CLASSES=(
   com.chengliu.app.core.DeadTargetsTest
   com.chengliu.app.core.SiblingIconScoreTest
   com.chengliu.app.core.MemoryHintTest
+  com.chengliu.app.core.GeometryGuessScoreTest
 )
 
 exec "$JAVA_HOME/bin/java" -cp "$CP" org.junit.runner.JUnitCore "${TEST_CLASSES[@]}"

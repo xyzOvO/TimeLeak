@@ -406,6 +406,9 @@ object SkipEngine {
         "立即打开", "马上抢", "去购买", "下单", "立即开通", "立即领取", "免费领",
         "看视频", "去领取", "打开应用", "进入小程序", "咨询客服", "立即咨询",
         "去查看", "去看看", "立即体验", "立即安装", "获取", "抢购", "立即预约",
+        // 反向 CTA：跳过按钮常和「进入广告」那颗胶囊同一排（甚至左右对称），
+        // 光靠「立即下载 / 打开」这些词盖不住 —— 一旦漏掉，点下去就是拉起第三方。
+        "进入", "前往", "跳转", "查看", "了解",
     )
 
     /**
@@ -522,7 +525,7 @@ object SkipEngine {
             if (strong || reason == HitReason.SUBSCRIPTION ||
                 reason == HitReason.TEXT_GUESS || reason == HitReason.COORDINATE ||
                 reason == HitReason.SIBLING_ICON ||
-                reason == HitReason.MEMORY
+                reason == HitReason.MEMORY || reason == HitReason.GEOMETRY
             ) return AdKind.SPLASH
         }
 

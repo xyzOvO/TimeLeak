@@ -2,6 +2,8 @@ package com.chengliu.app.core
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -58,6 +60,18 @@ class SkipEngineNegationTest {
             hit("splash_skip_btn"),
         )
         assertNull("恰好叫 skip 的控件被排除", hit("skip"))
+    }
+
+    @Test
+    fun reverseCtaIsNotSafeTarget() {
+        // 「跳过」和「进入广告」常常同排同款：左边白底小圆写「跳过」，
+        // 右边深灰胶囊写「立即进入 / 点击查看」。后者一旦被当成安全目标，
+        // 点下去就是拉起第三方（不是跳过）。
+        assertFalse("立即进入 是反向 CTA", SkipEngine.isSafeTarget("立即进入", ""))
+        assertFalse("查看 类按钮是 CTA", SkipEngine.isSafeTarget("点击查看 GO›", ""))
+        assertFalse("前往 是 CTA", SkipEngine.isSafeTarget("前往查看", ""))
+        assertTrue("真跳过仍是安全目标", SkipEngine.isSafeTarget("跳过", ""))
+        assertTrue("带倒计时的跳过仍是安全目标", SkipEngine.isSafeTarget("跳过 3", ""))
     }
 
     @Test

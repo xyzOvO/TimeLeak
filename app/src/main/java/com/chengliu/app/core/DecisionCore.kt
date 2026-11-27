@@ -22,7 +22,7 @@ object DecisionCore {
         if (kind == AdKind.POPUP && !mode.popup) return false
         if (!mode.textGuess &&
             (reason == HitReason.SUBSCRIPTION || reason == HitReason.TEXT_GUESS ||
-                reason == HitReason.SIBLING_ICON)
+                reason == HitReason.SIBLING_ICON || reason == HitReason.GEOMETRY)
         ) return false
         if (!mode.gesture && reason == HitReason.COORDINATE) return false
         return true
@@ -77,6 +77,7 @@ object DecisionCore {
         if (f.customRule) add(Weights.CUSTOM_RULE, "自定义关键词")
         if (f.coordinateRule) add(Weights.COORDINATE, "坐标兜底规则")
         if (f.siblingIcon) add(Weights.SIBLING_ICON, "同容器无文字图标补位")
+        if (f.geometry) add(Weights.GEOMETRY, "无文字可点控件（自绘跳过按钮）")
 
         if (f.inSplash) add(Weights.IN_SPLASH, "开屏时间窗内")
         if (f.freshWindow) reasons.add("新窗口会话")
@@ -102,7 +103,7 @@ object DecisionCore {
         if (!f.inSplash && !f.popupRound) add(Weights.OUTSIDE_WINDOW, "开屏时间窗之外")
         if (f.globalRule) add(Weights.GLOBAL_PENALTY, "全局规则未限定应用")
         if (!f.sdkId && !f.sdkClose && !f.explicitText && !f.corner && !f.siblingIcon &&
-            !f.remembered
+            !f.remembered && !f.geometry
         ) {
             add(Weights.SOFT_ONLY, "缺少硬信号")
         }
@@ -168,6 +169,7 @@ object DecisionCore {
             f.coordinateRule -> "coordinate:${f.left},${f.top}"
             f.siblingIcon -> "sibling:${f.id.substringAfterLast('/').ifEmpty { tail }}"
             f.remembered -> "memory:${f.id.substringAfterLast('/').ifEmpty { tail }}"
+            f.geometry -> "geom:${f.left},${f.top}"
             else -> "none"
         }
     }

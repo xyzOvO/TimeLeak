@@ -334,6 +334,11 @@ class AppPrefs(ctx: Context) {
     // ---------------- 跳过广告 · 高级（全部默认不改变既有行为） ----------------
 
     /** 按上一轮命中的控件 id 直取节点（快路径）；关掉就回到完整遍历。 */
+    /** 猜「无文字可点的小控件」是不是跳过按钮（自绘按钮的广告只能这么跳）。 */
+    var skipGeoTap: Boolean
+        get() = sp.getBoolean(KEY_SKIP_GEO, true)
+        set(v) = sp.edit().putBoolean(KEY_SKIP_GEO, v).apply()
+
     var skipFastPath: Boolean
         get() = sp.getBoolean(KEY_SKIP_FAST, true)
         set(v) = sp.edit().putBoolean(KEY_SKIP_FAST, v).apply()
@@ -496,6 +501,7 @@ class AppPrefs(ctx: Context) {
         private const val KEY_SUB_AUTO_APPLY = "sub_auto_apply"
         private const val KEY_LAST_NETWORK = "last_network_at"
         private const val KEY_SKIP_FAST = "skip_fast_path"
+        private const val KEY_SKIP_GEO = "skip_geo_tap"
         private const val KEY_SKIP_TOAST = "skip_toast"
         private const val KEY_SKIP_TOAST_TEXT = "skip_toast_text"
         private const val KEY_GUARD_TITLE = "guard_title"

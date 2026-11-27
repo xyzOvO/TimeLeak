@@ -34,6 +34,13 @@ enum class HitReason {
      */
     MEMORY,
 
+    /**
+     * 无文字可点控件：有的广告 SDK 把跳过按钮直接画在 Canvas 上，节点里既没有
+     * text 也没有 desc 和 id，只能靠「贴在角落 + 个头很小」去猜。
+     * 它是最后手段：只在开屏窗内、屏幕上确有广告痕迹、且每会话只猜一次。
+     */
+    GEOMETRY,
+
     /** 按坐标点一下，风险最高。 */
     COORDINATE,
 }
@@ -133,6 +140,12 @@ object Weights {
      */
     const val MEMORY = 62
 
+    /**
+     * 无文字可点控件：开屏窗内 56 分，配合「窄控件 + 可点击 + 开屏窗内」过 70 分线。
+     * 比补位图标还低一档 —— 它是纯几何猜测，没有任何文案佐证。
+     */
+    const val GEOMETRY = 56
+
     const val IN_SPLASH = 12
     const val NARROW = 8
     const val SHORT_TEXT = 5
@@ -202,6 +215,8 @@ data class NodeFacts(
 
     /** 这一条是 HitMemory 记住的、上次已验证生效的同一控件。 */
     val remembered: Boolean = false,
+    /** 无文字可点的小控件，靠位置与个头猜它是跳过按钮。 */
+    val geometry: Boolean = false,
     val scopedRule: Boolean = false,
     val globalRule: Boolean = false,
     val customRule: Boolean = false,

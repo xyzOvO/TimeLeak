@@ -23,7 +23,8 @@ object DeadTargets {
 
     private fun key(pkg: String?, viewId: String?): String? {
         if (pkg.isNullOrEmpty() || viewId.isNullOrEmpty()) return null
-        if (!viewId.contains(":id/")) return null
+        // 无 id 的自绘控件用几何位置当键（geom@l,t,r,b），同样允许拉黑。
+        if (!viewId.contains(":id/") && !viewId.startsWith("geom@")) return null
         return "$pkg|$viewId"
     }
 
