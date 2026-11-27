@@ -17,6 +17,12 @@ object HitGeometry {
     /** 窗口要占满屏幕到这个比例，几何猜测才认它是「整屏开屏广告」。 */
     const val FULL_SCREEN_RATIO = 0.80f
 
+    /**
+     * 放开猜的应用用这一档：开屏常常带一条底部品牌条，占满八成太严，
+     * 只要画面主体占掉六成、其余边角是自家 UI，就够当「整屏广告」看了。
+     */
+    const val BOLD_FULL_RATIO = 0.60f
+
     /** 控件面积占屏幕的比例，0~1。参数为 0 时返回 0，调用方无需先校验。 */
     fun areaRatio(w: Int, h: Int, screenW: Int, screenH: Int): Float {
         if (w <= 0 || h <= 0 || screenW <= 0 || screenH <= 0) return 0f
@@ -95,15 +101,36 @@ object HitGeometry {
     }
 
     /**
+     * 放开猜的应用用「四角」探索带：上下两排都算。
+     *
+     * 名单是用户按应用显式放行的，那类应用里「没有文字、贴着角落、个头很小、自身可点」
+     * 的控件几乎只可能是广告自己画的跳过按钮（有的就在左下角），所以放开到四个角；
+     * 没被放行的应用仍旧只认上方两角——底部那片几乎全是 tab / 返回 / 悬浮球。
+     */
+    fun isGuessBand(cx: Int, cy: Int, screenW: Int, screenH: Int, bold: Boolean): Boolean {
+        if (screenW <= 0 || screenH <= 0) return false
+        if (!bold) return isTopCornerBand(cx, cy, screenW, screenH)
+        val vertical = cy <= screenH * 0.25f || cy >= screenH * 0.75f
+        val horizontal = cx <= screenW * 0.22f || cx >= screenW * 0.78f
+        return vertical && horizontal
+    }
+
+    /**
      * 窗口是不是铺满屏幕：几何猜测只在整屏开屏广告上做。
      *
      * 悬浮通知 / 气泡 / 小窗同样会带来窗口事件，也照样被当成「开屏窗」12 秒；
      * 不校验面积的话，它们里面的悬浮按钮就会被当成跳过按钮（真机误判过两次）。
      */
-    fun coversScreen(w: Int, h: Int, screenW: Int, screenH: Int): Boolean {
+    fun coversScreen(
+        w: Int,
+        h: Int,
+        screenW: Int,
+        screenH: Int,
+        ratio: Float = FULL_SCREEN_RATIO,
+    ): Boolean {
         if (w <= 0 || h <= 0) return false
         if (screenW <= 0 || screenH <= 0) return false
-        return areaRatio(w, h, screenW, screenH) >= FULL_SCREEN_RATIO
+        return areaRatio(w, h, screenW, screenH) >= ratio
     }
 
     fun contains(

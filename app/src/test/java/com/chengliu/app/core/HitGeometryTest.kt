@@ -109,4 +109,36 @@ class HitGeometryTest {
         assertFalse(HitGeometry.coversScreen(600, 400, 1080, 2400))
         assertFalse(HitGeometry.coversScreen(0, 0, 1080, 2400))
     }
+
+    @Test
+    fun coversScreenHonoursBoldRatio() {
+        // 开屏常见「画面 + 一条底部品牌条」：占六成多，保守档不认，放开档认。
+        assertEquals(0.625f, HitGeometry.areaRatio(1080, 1500, 1080, 2400), 0.01f)
+        assertFalse(HitGeometry.coversScreen(1080, 1500, 1080, 2400))
+        assertTrue(
+            HitGeometry.coversScreen(
+                1080, 1500, 1080, 2400, HitGeometry.BOLD_FULL_RATIO,
+            ),
+        )
+    }
+
+    @Test
+    fun guessBandBoldAcceptsBottomCorners() {
+        // 放开档：四个角都认（有的广告把跳过画在左下）
+        assertTrue(HitGeometry.isGuessBand(99, 328, 1080, 2400, true))
+        assertTrue(HitGeometry.isGuessBand(99, 2200, 1080, 2400, true))
+        assertTrue(HitGeometry.isGuessBand(1000, 2200, 1080, 2400, true))
+        // 屏幕正中、只贴一边，仍然不算
+        assertFalse(HitGeometry.isGuessBand(540, 2200, 1080, 2400, true))
+        assertFalse(HitGeometry.isGuessBand(540, 1200, 1080, 2400, true))
+    }
+
+    @Test
+    fun guessBandConservativeStaysOnTopOnly() {
+        // 保守档：底部那片几乎全是 tab / 返回 / 悬浮球，一律不认
+        assertTrue(HitGeometry.isGuessBand(99, 328, 1080, 2400, false))
+        assertFalse(HitGeometry.isGuessBand(88, 2125, 1080, 2400, false))
+        assertFalse(HitGeometry.isGuessBand(29, 1916, 1080, 2400, false))
+        assertFalse(HitGeometry.isGuessBand(99, 328, 0, 0, false))
+    }
 }

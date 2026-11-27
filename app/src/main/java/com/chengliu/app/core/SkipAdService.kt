@@ -163,9 +163,13 @@ class SkipAdService : AccessibilityService() {
     /** 快路径：按上一轮命中的控件 id 直取节点，省掉整棵树遍历。 */
     private var fastPath = true
     /** 几何猜测：无文字可点的小控件也当候选（自绘跳过按钮只能这么跳）。 */
-    private var geoTap = true
-    /** 本次会话是否已经猜过一次：只猜一次，防止连续误点。 */
-    private var geoAttempted = false
+    // 与 AppPrefs.skipGeoTap 保持一致：默认关。几何猜测在真机上误判过两次
+    // （普通设置页右上角的「去设置」被当成自绘跳过按钮），要开必须由用户手动打开。
+    private var geoTap = false
+    /** 允许猜无文字跳过按钮的应用白名单，由 syncFlags() 跟随配置热更新。 */
+    private var guessApps: Set<String> = emptySet()
+    /** 本开屏窗口已经猜过几次；换窗口清零，上限由 [GuessTargets.maxTries] 决定。 */
+    private var geoTries = 0
 
     /** 高级开关缓存：附加动作、圆形倒计时、手势兜底、跳过提示。每次事件同步一次。 */
     private var extraTeen = false
@@ -458,8 +462,8 @@ class SkipAdService : AccessibilityService() {
         pacer.reset()
         // 新窗口的头一次内容变化仍然立即扫，别让上一个窗口的计数把首帧拖慢。
         contentSeenInWindow = false
-        // 几何猜测一个开屏窗口只猜一次；换了窗口就重新有资格猜。
-        geoAttempted = false
+        // 几何猜测按开屏窗口计数；换了窗口就重新有资格猜。
+        geoTries = 0
         // 新窗口已经在手上了，过渡期那次补扫就没意义了，先撤掉。
         handler.removeCallbacks(launcherRetry)
         launcherRetryPkg = null
@@ -673,6 +677,8 @@ class SkipAdService : AccessibilityService() {
         val deepAd: Boolean,
         /** 窗口是否铺满屏幕（几何猜测的前提）。 */
         val full: Boolean,
+        /** 这个窗口的猜测档位：名单内 BOLD（放开猜），名单外 OFF（一个候选都不收）。 */
+        val guess: GuessTargets.Mode,
         val abortResult: BeatResult?,
         val abortNote: String,
     )
@@ -699,6 +705,8 @@ class SkipAdService : AccessibilityService() {
         var full = false
         var abortResult: BeatResult? = null
         var abortNote = ""
+        // 猜测档位要活到 TreeRead 构造时，所以声明在 try 外层，赋值在里面。
+        var guessMode = GuessTargets.Mode.OFF
         try {
             val root = rootInActiveWindow
             if (root == null) {
@@ -714,6 +722,19 @@ class SkipAdService : AccessibilityService() {
                 // 取树的第一跳（拿窗口根节点）单独计时：那是系统 API，不归我们控制，
                 // 能优化的只有后面的遍历，所以两者必须分开记。
                 rootMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
+                // 猜测档位按「窗口根节点的真实包名」判定：名单内放开猜，名单外一个候选都不收。
+                // 总开关关掉时对谁都不猜；本窗口已经猜满了，这一轮连候选都不收（省掉几何采集成本）。
+                guessMode = if (geoTap) {
+                    GuessTargets.modeFor(realPkg, guessApps)
+                } else {
+                    GuessTargets.Mode.OFF
+                }
+                val guessLeft = geoTries < GuessTargets.maxTries(guessMode)
+                val plan = if (guessMode == GuessTargets.Mode.OFF || !guessLeft) {
+                    null
+                } else {
+                    GeoPlan(guessMode)
+                }
                 when {
                     realPkg == packageName || isSkipPkg(realPkg) -> {
                         abortResult = BeatResult.SELF
@@ -722,7 +743,7 @@ class SkipAdService : AccessibilityService() {
                     INSTALLER_PKGS.contains(realPkg) -> {
                         // 安装器窗口只跑安装弹窗拦截（还要接着匹配，所以取树）
                         if (extraInstall && !observe) {
-                            collect(root, refs, geoCands, 0, screen, deadline, 0)
+                            collect(root, refs, geoCands, plan, 0, screen, deadline, 0)
                         }
                         else {
                             abortResult = BeatResult.SELF
@@ -772,28 +793,37 @@ class SkipAdService : AccessibilityService() {
                                 // 就一个节点都查不到了，如果在这里忘掉，下次冷启动永远用不上记忆。
                                 // 所以记忆只当提示用：查不到就老实走完整扫描，条目不删，
                                 // 等下一次点中别的控件时自然覆盖。
-                                collect(root, refs, geoCands, 0, screen, deadline, 0)
+                                collect(root, refs, geoCands, plan, 0, screen, deadline, 0)
                             }
                         } else {
-                            collect(root, refs, geoCands, 0, screen, deadline, 0)
+                            collect(root, refs, geoCands, plan, 0, screen, deadline, 0)
                         }
                     }
                 }
                 // 整屏校验：悬浮通知 / 气泡 / 小窗也会带来窗口事件，也会被当成「开屏窗」12 秒。
                 // 不校验面积，它们里面的悬浮按钮就会被当成跳过按钮 —— 真机上已经误判过两次。
                 // 一并跳过深挖：不是整屏广告，没必要为它多读一趟节点。
+                val fullRatio = if (plan != null && plan.bold) {
+                    HitGeometry.BOLD_FULL_RATIO
+                } else {
+                    HitGeometry.FULL_SCREEN_RATIO
+                }
                 runCatching {
                     val rootBox = Rect()
                     root.getBoundsInScreen(rootBox)
                     full = HitGeometry.coversScreen(
-                        rootBox.width(), rootBox.height(), screen.width(), screen.height(),
+                        rootBox.width(), rootBox.height(), screen.width(), screen.height(), fullRatio,
                     )
                 }
                 if (!full) geoCands.clear()
                 // 广告文案常常藏在 WebView 虚拟节点的 19~20 层，常规遍历到 MAX_DEPTH 就停了，
                 // 于是「这屏像不像广告」永远看不到证据。只有真有几何候选、还没猜过的时候，
                 // 才补一趟只看文案的深挖 —— 平常路径一点成本都不加。
-                if (GeoGuess.needsDeepHint(geoTap, geoAttempted, geoCands.size, looksLikeAd(refs))) {
+                // 放开猜的应用不需要「这屏像不像广告」这一层证据（猜的判据换成了整屏 + 角落），
+                // 所以那种应用连深挖都不跑，省一趟读节点。
+                if (GuessTargets.needsAdEvidence(guessMode) &&
+                    GeoGuess.needsDeepHint(geoTap, !guessLeft, geoCands.size, looksLikeAd(refs))
+                ) {
                     deepAd = deepAdHint(root, deadline)
                 }
                 treeMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
@@ -822,6 +852,7 @@ class SkipAdService : AccessibilityService() {
             geo = geoCands,
             deepAd = deepAd,
             full = full,
+            guess = guessMode,
             abortResult = abortResult,
             abortNote = abortNote,
         )
@@ -1029,17 +1060,21 @@ class SkipAdService : AccessibilityService() {
             // 才去猜那个「无文字、可点、贴在角落、个头很小」的控件。
             // 每会话只猜一次；猜出来的目标照样过 click() 的全部闸门与二次验证。
             // 广告痕迹可能来自常规遍历（浅层文案），也可能来自 worker 上的深挖一轮。
-            val adHint = looksLikeAd(refs) || t.deepAd
+            // 名单内的应用不看广告话术（那是给保守档当前置证据的）；
+            // 名单外的应用根本走不到这里（readTree 已经把候选收成了空表）。
+            val adHint = !GuessTargets.needsAdEvidence(t.guess) || looksLikeAd(refs) || t.deepAd
+            val guessMax = GuessTargets.maxTries(t.guess)
             if (t.geo.isNotEmpty()) {
                 android.util.Log.i(
                     "SkipAd",
-                    "几何候选=${t.geo.size} 广告痕迹=${looksLikeAd(refs)} 深挖=${t.deepAd} " +
-                        "整屏=${t.full} 已猜=$geoAttempted",
+                    "几何候选=${t.geo.size} 猜测=${t.guess} 广告痕迹=${looksLikeAd(refs)} " +
+                        "深挖=${t.deepAd} 整屏=${t.full} 已猜=$geoTries/$guessMax",
                 )
             }
-            if (GeoGuess.shouldGuess(geoTap, geoAttempted, scanHitRule != null, t.geo.size, adHint)) {
-                geoAttempted = true
+            if (GeoGuess.shouldGuess(geoTap, geoTries >= guessMax, scanHitRule != null, t.geo.size, adHint)) {
                 for (r in t.geo) {
+                    if (geoTries >= guessMax) break
+                    geoTries++
                     if (click(r, now, HitReason.GEOMETRY)) return
                 }
             }
@@ -1407,11 +1442,21 @@ class SkipAdService : AccessibilityService() {
         return Ref(index, text, desc, id, rect, cls, node.isClickable)
     }
 
+    /**
+     * 这一轮允许怎么猜。[bold] 为真时按放开档收候选（四角 + 免话术 + 六成铺屏）；
+     * 为 null 表示压根不猜——名单外的应用、或者本窗口已经猜满了。
+     */
+    private class GeoPlan(val mode: GuessTargets.Mode) {
+        val bold: Boolean get() = mode == GuessTargets.Mode.BOLD
+    }
+
     private fun collect(
         node: AccessibilityNodeInfo?,
         out: MutableList<Ref>,
         /** 无文字可点的小控件：单独收在这里，不混进候选表。 */
         geo: MutableList<Ref>,
+        /** 这一轮允许怎么猜；null = 不猜。 */
+        plan: GeoPlan?,
         depth: Int,
         screen: Rect,
         deadline: Long,
@@ -1437,7 +1482,7 @@ class SkipAdService : AccessibilityService() {
             ) {
                 out.add(Ref(index, text, desc, id, rect, cls, clickable))
             }
-        } else if (geoTap && !geoAttempted && geo.size < MAX_GEO_CANDS) {
+        } else if (plan != null && geo.size < MAX_GEO_CANDS) {
             // 自绘按钮：跳过按钮直接画在 Canvas 上，节点里既没文字也没 id，
             // 只剩「位置 + 个头 + 可点」。这里只负责把它当候选收着，
             // 点不点由 finishScan 的几何轮（连同全部闸门）决定。
@@ -1449,8 +1494,8 @@ class SkipAdService : AccessibilityService() {
                     HitGeometry.isSmallControl(
                         grect.width(), grect.height(), screen.width(), screen.height(),
                     ) &&
-                    HitGeometry.isTopCornerBand(
-                        grect.centerX(), grect.centerY(), screen.width(), screen.height(),
+                    HitGeometry.isGuessBand(
+                        grect.centerX(), grect.centerY(), screen.width(), screen.height(), plan.bold,
                     )
                 ) {
                     geo.add(Ref(index, "", "", "", grect, "", true))
@@ -1463,7 +1508,7 @@ class SkipAdService : AccessibilityService() {
             if (scanNodes.size >= MAX_VISITED || out.size >= MAX_NODES) return
             val child = node.getChild(i) ?: continue
             scanNodes.add(child)
-            collect(child, out, geo, depth + 1, screen, deadline, scanNodes.size - 1)
+            collect(child, out, geo, plan, depth + 1, screen, deadline, scanNodes.size - 1)
         }
     }
 
@@ -2061,6 +2106,7 @@ class SkipAdService : AccessibilityService() {
         observe = prefs.observeMode
         fastPath = prefs.skipFastPath
         geoTap = prefs.skipGeoTap
+        guessApps = prefs.guessApps
         ExtraRules.roundEnabled = prefs.roundCountdown
         extraTeen = prefs.teenPopup
         extraWechat = prefs.wechatOriginal

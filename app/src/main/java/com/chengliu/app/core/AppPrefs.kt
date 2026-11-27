@@ -335,9 +335,29 @@ class AppPrefs(ctx: Context) {
 
     /** 按上一轮命中的控件 id 直取节点（快路径）；关掉就回到完整遍历。 */
     /** 猜「无文字可点的小控件」是不是跳过按钮（自绘按钮的广告只能这么跳）。 */
+    /**
+     * 猜测总开关。真正决定「猜不猜」的是 [guessApps] 白名单：名单里的应用才猜，
+     * 名单外的应用连候选都不收。这个开关只用来一键停掉全部猜测，
+     * 所以默认开着也不影响「名单为空时不猜」的安全性。
+     */
     var skipGeoTap: Boolean
         get() = sp.getBoolean(KEY_SKIP_GEO, true)
         set(v) = sp.edit().putBoolean(KEY_SKIP_GEO, v).apply()
+
+    /** 允许「猜无文字跳过按钮」的应用白名单；名单外的应用一律不猜。 */
+    var guessApps: Set<String>
+        get() = (sp.getStringSet(KEY_GUESS_APPS, emptySet()) ?: emptySet()).toSet()
+        set(v) = sp.edit().putStringSet(KEY_GUESS_APPS, v.toSet()).apply()
+
+    fun addGuessApp(pkg: String) {
+        val p = pkg.trim()
+        if (p.isEmpty() || !p.contains('.')) return
+        guessApps = guessApps + p
+    }
+
+    fun removeGuessApp(pkg: String) {
+        guessApps = guessApps - pkg
+    }
 
     var skipFastPath: Boolean
         get() = sp.getBoolean(KEY_SKIP_FAST, true)
@@ -502,6 +522,7 @@ class AppPrefs(ctx: Context) {
         private const val KEY_LAST_NETWORK = "last_network_at"
         private const val KEY_SKIP_FAST = "skip_fast_path"
         private const val KEY_SKIP_GEO = "skip_geo_tap"
+        private const val KEY_GUESS_APPS = "guess_apps"
         private const val KEY_SKIP_TOAST = "skip_toast"
         private const val KEY_SKIP_TOAST_TEXT = "skip_toast_text"
         private const val KEY_GUARD_TITLE = "guard_title"

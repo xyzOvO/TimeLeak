@@ -1265,6 +1265,10 @@ private fun StatLine(title: String, value: String, color: Color) {
 @Composable
 private fun ToggleLine(title: String, note: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     val ui = LocalUi.current
+    // 说明长短差很多：短的照原样铺开，长的先给一句摘要，点「展开」再看全文。
+    // 二十几行说明全铺开，真正需要他拍板的那两项就淹在字里了。
+    var expanded by remember { mutableStateOf(false) }
+    val long = note.length > 56
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1274,7 +1278,27 @@ private fun ToggleLine(title: String, note: String, checked: Boolean, onChange: 
         Column(Modifier.weight(1f)) {
             Text(title, fontSize = 14.sp, color = ui.text)
             Spacer(Modifier.height(3.dp))
-            Note(note)
+            if (!long || expanded) {
+                Note(note)
+                if (long) {
+                    Text(
+                        "收起",
+                        fontSize = 11.sp,
+                        color = ui.accent,
+                        modifier = Modifier.clickable { expanded = false },
+                    )
+                }
+            } else {
+                val dot = note.indexOf('。')
+                val cut = if (dot in 1 until 60) dot + 1 else minOf(note.length, 56)
+                Note(note.take(cut) + if (cut < note.length) "…" else "")
+                Text(
+                    "展开",
+                    fontSize = 11.sp,
+                    color = ui.accent,
+                    modifier = Modifier.clickable { expanded = true },
+                )
+            }
         }
         Spacer(Modifier.width(12.dp))
         Switch(checked = checked, onCheckedChange = onChange)
@@ -1724,6 +1748,9 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     var gestureFallback by remember { mutableStateOf(prefs.gestureFallback) }
     var fastPath by remember { mutableStateOf(prefs.skipFastPath) }
     var geoTap by remember { mutableStateOf(prefs.skipGeoTap) }
+    var guessApps by remember { mutableStateOf(prefs.guessApps) }
+    var showAddGuess by remember { mutableStateOf(false) }
+    var guessQuery by remember { mutableStateOf("") }
     var roundCountdown by remember { mutableStateOf(prefs.roundCountdown) }
     var skipToast by remember { mutableStateOf(prefs.skipToast) }
     var toastText by remember { mutableStateOf(prefs.skipToastText) }
@@ -2004,6 +2031,72 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
             },
             confirmButton = {
                 TextButton(onClick = { editPolicyPkg = null }) { Text("关闭", color = ui.accent) }
+            },
+        )
+    }
+
+    if (showAddGuess) {
+        val q = guessQuery.trim().lowercase()
+        val pool = installedApps.filter { (p, _) -> !guessApps.contains(p) }
+        val candidates = if (q.isEmpty()) {
+            pool.take(40)
+        } else {
+            pool.filter {
+                it.first.lowercase().contains(q) || it.second.lowercase().contains(q)
+            }.take(40)
+        }
+        AlertDialog(
+            onDismissRequest = { showAddGuess = false },
+            containerColor = ui.card,
+            titleContentColor = ui.text,
+            textContentColor = ui.text,
+            title = { Text("放行一个应用", fontSize = 16.sp, fontWeight = FontWeight.Medium) },
+            text = {
+                Column {
+                    Note("放行 = 允许在这个应用的开屏页猜无文字按钮。加完先冷启动几次，确认点的是跳过。")
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = guessQuery,
+                        onValueChange = { guessQuery = it },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("搜索应用名，或直接填包名") },
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Column(Modifier.heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
+                        candidates.forEach { (p, label) ->
+                            Column(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        prefs.addGuessApp(p)
+                                        guessApps = prefs.guessApps
+                                        showAddGuess = false
+                                    }
+                                    .padding(vertical = 8.dp),
+                            ) {
+                                Text(label, fontSize = 13.sp, color = ui.text)
+                                Text(p, fontSize = 10.sp, color = ui.sub)
+                            }
+                        }
+                        if (candidates.isEmpty()) Note("没找到匹配的应用，也可以在下面直接按包名放行。")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val p = guessQuery.trim()
+                    if (p.contains('.') && p.length > 3) {
+                        prefs.addGuessApp(p)
+                        guessApps = prefs.guessApps
+                        showAddGuess = false
+                    } else {
+                        message = "请输入完整包名，例如 com.example.app"
+                    }
+                }) { Text("按包名放行", color = ui.accent) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddGuess = false }) { Text("取消", color = ui.sub) }
             },
         )
     }
@@ -2299,6 +2392,19 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     }
     Spacer(Modifier.height(12.dp))
 
+    // 全部设置里只有这两项真的需要他拍板：一个决定「在哪猜」，一个决定「猜了之后点不点」。
+    Card {
+        SectionLabel("需要你决定")
+        Note("其余开关都有安全默认值，可以不动；这两项直接决定会不会点错东西。")
+        Spacer(Modifier.height(6.dp))
+        Note(
+            "观察模式：" + (if (observe) "开 · 只识别不点击" else "关 · 命中就真的点") +
+                "；猜测白名单：" + (if (guessApps.isEmpty()) "空 · 谁都不猜" else "${guessApps.size} 个应用可猜") +
+                "（在下面「猜测白名单」里改）",
+        )
+    }
+    Spacer(Modifier.height(12.dp))
+
     // 安全观察模式放在状态卡正下方：这是规则上线前最该先看到的东西。
     Card {
         SectionLabel("安全观察模式（核心功能）")
@@ -2535,6 +2641,42 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     }
     Spacer(Modifier.height(12.dp))
 
+    // 猜测白名单：自绘跳过按钮的广告只能靠「位置 + 个头」猜，风险按应用分开管。
+    Card {
+        SectionLabel("猜测白名单（按应用）")
+        Note(
+            "有的广告把「跳过」直接画在画面上，控件里既没有文字也没有 id，只能靠「贴角落 + 个头小 + 自身可点」去猜。" +
+                "猜测有风险：普通设置页右上角的「去设置」长得一模一样，真机上就被点掉过。" +
+                "所以默认一个都不猜；在这里放行的应用会放开猜——四个角都认、不再要求广告话术、" +
+                "窗口占屏六成即可，每个开屏窗口最多两次，仍然走完整判定、二次验证与点击后复核。",
+        )
+        Spacer(Modifier.height(8.dp))
+        ToggleLine(
+            "允许在名单内猜测",
+            "关掉后名单里的应用也不再猜；名单外的应用无论开关如何都不猜",
+            geoTap,
+        ) { geoTap = it; prefs.skipGeoTap = it }
+        guessApps.sorted().forEach { pkg ->
+            RuleRow(SkipPolicyStore.displayName(ctx, pkg)) {
+                prefs.removeGuessApp(pkg)
+                guessApps = prefs.guessApps
+            }
+        }
+        if (guessApps.isEmpty()) {
+            Note("名单为空：目前没有任何应用允许猜测，遇到自绘跳过按钮会漏掉。")
+        }
+        Spacer(Modifier.height(6.dp))
+        ActionButton(
+            "＋ 放行一个应用",
+            { guessQuery = ""; showAddGuess = true },
+            Modifier.fillMaxWidth(),
+            onCard = true,
+        )
+        Spacer(Modifier.height(6.dp))
+        Note("只在「按文案怎么都点不掉」的应用上加；加完拿它冷启动几次，确认点的是跳过而不是别的按钮。")
+    }
+    Spacer(Modifier.height(12.dp))
+
     // 高级：增强项全部收在这张默认折叠的卡里，不新增页面、不占主界面高度。
     Card {
         Row(
@@ -2561,7 +2703,7 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
             Note("默认折叠。展开后可逐项开关；两处文案长按对应行修改。")
         } else {
             Spacer(Modifier.height(8.dp))
-            AdvancedGroupLabel("点击与识别")
+            AdvancedGroupLabel("识别与点击")
             ToggleLine(
                 "手势点击兜底",
                 "控件自身点不动时，按坐标补一次手势点击；仍然走原来的广告判定与二次验证",
@@ -2573,14 +2715,6 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                     "取到的仍是真节点，判定与二次验证一步不少。异常时关掉即回到完整扫描",
                 fastPath,
             ) { fastPath = it; prefs.skipFastPath = it }
-            ToggleLine(
-                "猜无文字跳过按钮",
-                "有的广告把「跳过」直接画在画面上，控件里既没有文字也没有 id；开启后，" +
-                    "在所有文案规则都没点到的开屏广告上，会试着点一次「贴在角落、个头很小、" +
-                    "自身可点」的控件（每次打开最多猜一次，仍走完整判定与点击后复核）。" +
-                    "这是猜测，误点风险比其它识别方式高，觉得点错东西就把它关掉",
-                geoTap,
-            ) { geoTap = it; prefs.skipGeoTap = it }
             ToggleLine(
                 "识别圆形倒计时按钮",
                 "开屏角落只有「3」「3s」的圆形跳过按钮，按内置强信号识别；不是自绘坐标点击",
@@ -2622,7 +2756,7 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                 RecentsVisibility.apply(ctx, it)
             }
 
-            AdvancedGroupLabel("附加动作（默认全关）")
+            AdvancedGroupLabel("附加与备份（默认全关）")
             ToggleLine(
                 "自动关闭青少年模式弹窗",
                 "同屏出现「青少年模式」提示、且只有一个「我知道了 / 关闭」按钮时才点；不会点「开启」类按钮",
@@ -2646,7 +2780,6 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
             Spacer(Modifier.height(4.dp))
             Note("这几项点的不是广告，走独立通道，但仍复用二次验证、冷却与每窗口点击上限；观察模式和设为「不自动点击」的应用一律不执行。安装拦截会点系统界面，默认关闭。")
 
-            AdvancedGroupLabel("广告规则备份")
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 ActionButton(
                     "导出规则",
