@@ -685,11 +685,21 @@ private fun ObservationCard(o: Observation) {
         )
         if (o.reasons.isNotEmpty()) {
             Spacer(Modifier.height(5.dp))
-            Text("依据：" + o.reasons.takeLast(4).joinToString("；"), fontSize = 10.sp,
-                color = ui.sub, lineHeight = 15.sp, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            // 只显示最后 4 条会把权重最大的那条截掉（几何猜测 +56 就是第一条），
+            // 于是「82 分」旁边写着合计 26 分的依据，看上去像乱判。这里全量列，并标出合计。
+            val shown = if (o.reasons.size <= MAX_REASONS_SHOWN) o.reasons
+            else o.reasons.take(MAX_REASONS_SHOWN) + "…（共 ${o.reasons.size} 条）"
+            Text(
+                "依据：" + shown.joinToString("；") + "；合计 ${o.score}",
+                fontSize = 10.sp, color = ui.sub, lineHeight = 15.sp, maxLines = 5,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
+
+/** 观察记录里依据最多显示几条（超出的用「…（共 N 条）」收尾）。 */
+private const val MAX_REASONS_SHOWN = 8
 
 // ---------------- 隐私审计 ----------------
 

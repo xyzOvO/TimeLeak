@@ -671,6 +671,8 @@ class SkipAdService : AccessibilityService() {
         val geo: List<Ref>,
         /** 深挖一轮后看到的广告痕迹：常规遍历深度不够时，只有这趟能给出证据。 */
         val deepAd: Boolean,
+        /** 窗口是否铺满屏幕（几何猜测的前提）。 */
+        val full: Boolean,
         val abortResult: BeatResult?,
         val abortNote: String,
     )
@@ -694,6 +696,7 @@ class SkipAdService : AccessibilityService() {
         val refs = ArrayList<Ref>(64)
         val geoCands = ArrayList<Ref>(MAX_GEO_CANDS)
         var deepAd = false
+        var full = false
         var abortResult: BeatResult? = null
         var abortNote = ""
         try {
@@ -776,6 +779,17 @@ class SkipAdService : AccessibilityService() {
                         }
                     }
                 }
+                // 整屏校验：悬浮通知 / 气泡 / 小窗也会带来窗口事件，也会被当成「开屏窗」12 秒。
+                // 不校验面积，它们里面的悬浮按钮就会被当成跳过按钮 —— 真机上已经误判过两次。
+                // 一并跳过深挖：不是整屏广告，没必要为它多读一趟节点。
+                runCatching {
+                    val rootBox = Rect()
+                    root.getBoundsInScreen(rootBox)
+                    full = HitGeometry.coversScreen(
+                        rootBox.width(), rootBox.height(), screen.width(), screen.height(),
+                    )
+                }
+                if (!full) geoCands.clear()
                 // 广告文案常常藏在 WebView 虚拟节点的 19~20 层，常规遍历到 MAX_DEPTH 就停了，
                 // 于是「这屏像不像广告」永远看不到证据。只有真有几何候选、还没猜过的时候，
                 // 才补一趟只看文案的深挖 —— 平常路径一点成本都不加。
@@ -807,6 +821,7 @@ class SkipAdService : AccessibilityService() {
             refs = refs,
             geo = geoCands,
             deepAd = deepAd,
+            full = full,
             abortResult = abortResult,
             abortNote = abortNote,
         )
@@ -1018,7 +1033,8 @@ class SkipAdService : AccessibilityService() {
             if (t.geo.isNotEmpty()) {
                 android.util.Log.i(
                     "SkipAd",
-                    "几何候选=${t.geo.size} 广告痕迹=${looksLikeAd(refs)} 深挖=${t.deepAd} 已猜=$geoAttempted",
+                    "几何候选=${t.geo.size} 广告痕迹=${looksLikeAd(refs)} 深挖=${t.deepAd} " +
+                        "整屏=${t.full} 已猜=$geoAttempted",
                 )
             }
             if (GeoGuess.shouldGuess(geoTap, geoAttempted, scanHitRule != null, t.geo.size, adHint)) {
@@ -1433,7 +1449,7 @@ class SkipAdService : AccessibilityService() {
                     HitGeometry.isSmallControl(
                         grect.width(), grect.height(), screen.width(), screen.height(),
                     ) &&
-                    HitGeometry.isEdgeBand(
+                    HitGeometry.isTopCornerBand(
                         grect.centerX(), grect.centerY(), screen.width(), screen.height(),
                     )
                 ) {

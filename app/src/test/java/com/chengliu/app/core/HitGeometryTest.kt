@@ -87,12 +87,26 @@ class HitGeometryTest {
     }
 
     @Test
-    fun edgeBandAcceptsCornersOnly() {
-        assertTrue(HitGeometry.isEdgeBand(99, 328, 1080, 2400))
-        assertTrue(HitGeometry.isEdgeBand(1000, 2200, 1080, 2400))
-        // 屏幕正中间那一大片热区不算
-        assertFalse(HitGeometry.isEdgeBand(540, 1200, 1080, 2400))
-        // 只贴一条边、不贴另一条，也不算角落
-        assertFalse(HitGeometry.isEdgeBand(540, 200, 1080, 2400))
+    fun topCornerBandAcceptsTopCornersOnly() {
+        // 真机样本：左上角自绘跳过 99,328；右上角跳过 911,273
+        assertTrue(HitGeometry.isTopCornerBand(99, 328, 1080, 2400))
+        assertTrue(HitGeometry.isTopCornerBand(911, 273, 1080, 2400))
+        // 真机误判样本：左下角 88,2125 / 29,1916，都是普通 UI（悬浮球 / 导航图标），必须排除
+        assertFalse(HitGeometry.isTopCornerBand(88, 2125, 1080, 2400))
+        assertFalse(HitGeometry.isTopCornerBand(29, 1916, 1080, 2400))
+        // 屏幕中央、只贴一条边、退化输入都不算角落
+        assertFalse(HitGeometry.isTopCornerBand(540, 1200, 1080, 2400))
+        assertFalse(HitGeometry.isTopCornerBand(540, 200, 1080, 2400))
+        assertFalse(HitGeometry.isTopCornerBand(99, 328, 0, 0))
+    }
+
+    @Test
+    fun coversScreenRequiresNearlyFullscreen() {
+        assertTrue(HitGeometry.coversScreen(1080, 2400, 1080, 2400))
+        // 底下留一条状态栏 / 导航栏的空：仍算整屏
+        assertTrue(HitGeometry.coversScreen(1080, 2000, 1080, 2400))
+        // 悬浮通知那种小窗：一角而已，不算整屏
+        assertFalse(HitGeometry.coversScreen(600, 400, 1080, 2400))
+        assertFalse(HitGeometry.coversScreen(0, 0, 1080, 2400))
     }
 }

@@ -14,6 +14,9 @@ object HitGeometry {
     /** 可点祖先覆盖超过这个比例，就不当作跳过按钮，而是广告热区。 */
     const val TRAP_AREA_RATIO = 0.50f
 
+    /** 窗口要占满屏幕到这个比例，几何猜测才认它是「整屏开屏广告」。 */
+    const val FULL_SCREEN_RATIO = 0.80f
+
     /** 控件面积占屏幕的比例，0~1。参数为 0 时返回 0，调用方无需先校验。 */
     fun areaRatio(w: Int, h: Int, screenW: Int, screenH: Int): Float {
         if (w <= 0 || h <= 0 || screenW <= 0 || screenH <= 0) return 0f
@@ -78,15 +81,29 @@ object HitGeometry {
     }
 
     /**
-     * 贴在屏幕边缘带：跳过按钮几乎都躲在四角或上下边缘（左上 / 右上 / 右下）。
-     * 要求纵向在上下 25% 之内、且横向在左右 18% 之内 —— 两条边都占，才算「角落」，
-     * 屏幕中央那一大片热区一律不算。
+     * 贴在**上方**角落：真跳过按钮要么在左上，要么在右上。
+     *
+     * 早先这里也收下方 25%，真机上付了代价：左下角的小可点图标几乎全是普通 UI
+     * （悬浮球 / 气泡 / 返回键 / tab 图标），两个根本没广告的应用先后被判成「开屏广告」。
+     * 现在只认「纵向在上 25% 且横向落在左右 25% 之外」这一档；漏掉的只是「贴底又完全没有文字」
+     * 的跳过按钮——带文案的底部跳过由文本轮负责。
      */
-    fun isEdgeBand(cx: Int, cy: Int, screenW: Int, screenH: Int): Boolean {
+    fun isTopCornerBand(cx: Int, cy: Int, screenW: Int, screenH: Int): Boolean {
         if (screenW <= 0 || screenH <= 0) return false
-        val vertical = cy <= screenH * 0.25f || cy >= screenH * 0.75f
-        val horizontal = cx <= screenW * 0.18f || cx >= screenW * 0.82f
-        return vertical && horizontal
+        if (cy > screenH * 0.25f) return false
+        return cx <= screenW * 0.25f || cx >= screenW * 0.75f
+    }
+
+    /**
+     * 窗口是不是铺满屏幕：几何猜测只在整屏开屏广告上做。
+     *
+     * 悬浮通知 / 气泡 / 小窗同样会带来窗口事件，也照样被当成「开屏窗」12 秒；
+     * 不校验面积的话，它们里面的悬浮按钮就会被当成跳过按钮（真机误判过两次）。
+     */
+    fun coversScreen(w: Int, h: Int, screenW: Int, screenH: Int): Boolean {
+        if (w <= 0 || h <= 0) return false
+        if (screenW <= 0 || screenH <= 0) return false
+        return areaRatio(w, h, screenW, screenH) >= FULL_SCREEN_RATIO
     }
 
     fun contains(

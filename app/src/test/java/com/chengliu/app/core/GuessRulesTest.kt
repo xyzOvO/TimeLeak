@@ -30,6 +30,8 @@ class GuessRulesTest {
     fun hotspotOnlyAcceptsCallToAction() {
         assertTrue(AdHints.looksLikeHotspot("点击到落地页或三方APP", ""))
         assertTrue(AdHints.looksLikeHotspot("点击跳转至详情页或者第三方应用", ""))
+        // 「点击查看」这种词在普通界面到处都是，不能当整屏广告的证据（真机上误判过）
+        assertFalse(AdHints.looksLikeHotspot("点击查看详情", ""))
         // 信息流里的「广告」标签不算整屏广告的证据
         assertFalse(AdHints.looksLikeHotspot("广告", "推广"))
         assertTrue(AdHints.looksLikeAd("广告", "推广"))
