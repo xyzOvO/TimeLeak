@@ -669,6 +669,8 @@ class SkipAdService : AccessibilityService() {
         val refs: List<Ref>,
         /** 无文字可点的小控件候选（几何猜测用）。 */
         val geo: List<Ref>,
+        /** 深挖一轮后看到的广告痕迹：常规遍历深度不够时，只有这趟能给出证据。 */
+        val deepAd: Boolean,
         val abortResult: BeatResult?,
         val abortNote: String,
     )
@@ -691,6 +693,7 @@ class SkipAdService : AccessibilityService() {
         var screen = Rect(0, 0, 0, 0)
         val refs = ArrayList<Ref>(64)
         val geoCands = ArrayList<Ref>(MAX_GEO_CANDS)
+        var deepAd = false
         var abortResult: BeatResult? = null
         var abortNote = ""
         try {
@@ -773,6 +776,12 @@ class SkipAdService : AccessibilityService() {
                         }
                     }
                 }
+                // 广告文案常常藏在 WebView 虚拟节点的 19~20 层，常规遍历到 MAX_DEPTH 就停了，
+                // 于是「这屏像不像广告」永远看不到证据。只有真有几何候选、还没猜过的时候，
+                // 才补一趟只看文案的深挖 —— 平常路径一点成本都不加。
+                if (GeoGuess.needsDeepHint(geoTap, geoAttempted, geoCands.size, looksLikeAd(refs))) {
+                    deepAd = deepAdHint(root, deadline)
+                }
                 treeMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
             }
         } catch (t: Throwable) {
@@ -797,6 +806,7 @@ class SkipAdService : AccessibilityService() {
             screen = screen,
             refs = refs,
             geo = geoCands,
+            deepAd = deepAd,
             abortResult = abortResult,
             abortNote = abortNote,
         )
@@ -1003,15 +1013,15 @@ class SkipAdService : AccessibilityService() {
             // 几何猜测轮：靠文案的轮次全没点到，屏幕上又确实有广告痕迹，
             // 才去猜那个「无文字、可点、贴在角落、个头很小」的控件。
             // 每会话只猜一次；猜出来的目标照样过 click() 的全部闸门与二次验证。
+            // 广告痕迹可能来自常规遍历（浅层文案），也可能来自 worker 上的深挖一轮。
+            val adHint = looksLikeAd(refs) || t.deepAd
             if (t.geo.isNotEmpty()) {
                 android.util.Log.i(
                     "SkipAd",
-                    "几何候选=${t.geo.size} 广告痕迹=${looksLikeAd(refs)} 已猜=$geoAttempted",
+                    "几何候选=${t.geo.size} 广告痕迹=${looksLikeAd(refs)} 深挖=${t.deepAd} 已猜=$geoAttempted",
                 )
             }
-            if (!geoAttempted && geoTap && scanHitRule == null && t.geo.isNotEmpty() &&
-                looksLikeAd(refs)
-            ) {
+            if (GeoGuess.shouldGuess(geoTap, geoAttempted, scanHitRule != null, t.geo.size, adHint)) {
                 geoAttempted = true
                 for (r in t.geo) {
                     if (click(r, now, HitReason.GEOMETRY)) return
@@ -1048,13 +1058,43 @@ class SkipAdService : AccessibilityService() {
      */
     private fun looksLikeAd(refs: List<Ref>): Boolean {
         for (r in refs) {
-            val s = (r.text + " " + r.desc).lowercase()
-            if (s.isBlank()) continue
-            for (k in AD_HINTS) {
-                if (s.contains(k)) return true
-            }
+            if (AdHints.looksLikeAd(r.text, r.desc)) return true
         }
         return false
+    }
+
+    /**
+     * 深挖一轮广告文案（worker 线程，只在几何猜测可能用到时跑）。
+     *
+     * 只读 text/desc，且只认「点击跳转 / 落地页 / 第三方应用」这类热区话术 ——
+     * 信息流里那种「广告」小标签到处都是，用它当证据会把普通页也判成广告页。
+     * 不建 [Ref]、不进候选表，节点与耗时上限都比常规遍历更紧；
+     * 拿到的子节点当场释放，不登记进 [scanNodes]，免得和常规遍历重复回收。
+     */
+    private fun deepAdHint(root: AccessibilityNodeInfo, deadline: Long): Boolean {
+        val deepDeadline = minOf(
+            deadline,
+            android.os.SystemClock.elapsedRealtime() + DEEP_AD_TIMEOUT_MS,
+        )
+        var visited = 0
+        fun walk(node: AccessibilityNodeInfo?, depth: Int): Boolean {
+            if (node == null || depth > DEEP_AD_DEPTH) return false
+            if (visited >= DEEP_AD_NODES) return false
+            if (android.os.SystemClock.elapsedRealtime() > deepDeadline) return false
+            visited++
+            val text = node.text?.toString().orEmpty()
+            val desc = node.contentDescription?.toString().orEmpty()
+            if (AdHints.looksLikeHotspot(text, desc)) return true
+            val count = node.childCount
+            for (i in 0 until count) {
+                val child = runCatching { node.getChild(i) }.getOrNull() ?: continue
+                val hit = runCatching { walk(child, depth + 1) }.getOrDefault(false)
+                recycleNode(child)
+                if (hit) return true
+            }
+            return false
+        }
+        return runCatching { walk(root, 0) }.getOrDefault(false)
     }
 
     /** 写一条扫描心跳。只在内存，最多 40 条，同一应用同一结论 10 秒内合并。 */
@@ -2131,8 +2171,12 @@ class SkipAdService : AccessibilityService() {
         /** 几何猜测轮最多收几个候选（只收屏幕边缘带的小控件，宁少勿滥）。 */
         const val MAX_GEO_CANDS = 6
 
-        /** 广告痕迹词：几何猜测只在屏幕上出现这些词时才启用。 */
-        private val AD_HINTS = listOf("广告", "推广", "赞助", "点击跳转", "落地页", "第三方应用")
+        /** 深挖广告文案的深度上限：WebView 虚拟节点实测到 19~20 层，常规遍历只到 12 层。 */
+        const val DEEP_AD_DEPTH = 24
+
+        /** 深挖时的节点与耗时上限，都比常规遍历更紧，别为一次猜测拖慢主流程。 */
+        const val DEEP_AD_NODES = 400
+        const val DEEP_AD_TIMEOUT_MS = 120L
 
         /**
          * 开屏窗之外（二次弹窗、页面内广告的关闭按钮）的合并上限。
