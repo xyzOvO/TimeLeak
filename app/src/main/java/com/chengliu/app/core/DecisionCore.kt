@@ -21,7 +21,8 @@ object DecisionCore {
         if (kind == AdKind.SPLASH && !mode.splash) return false
         if (kind == AdKind.POPUP && !mode.popup) return false
         if (!mode.textGuess &&
-            (reason == HitReason.SUBSCRIPTION || reason == HitReason.TEXT_GUESS)
+            (reason == HitReason.SUBSCRIPTION || reason == HitReason.TEXT_GUESS ||
+                reason == HitReason.SIBLING_ICON)
         ) return false
         if (!mode.gesture && reason == HitReason.COORDINATE) return false
         return true
@@ -44,6 +45,12 @@ object DecisionCore {
 
         if (!f.visible) return reject("节点不可见")
         if (!f.safeTarget) return reject("业务按钮 / 否定词，禁止点击")
+        // 假按钮：文案写着「跳过」，自己却不可点，唯一能点的祖先是整屏广告图。
+        // 这种情况文案、位置、字号全和真按钮一样，只有面积比能分出来。
+        // 硬否决放在评分之前，因为它的分数会很高，靠减分压不住。
+        if (f.trapAncestor) {
+            return reject("可点祖先覆盖整屏 ${f.ancestorAreaPct}%（疑似假按钮 / 广告热区）")
+        }
         if (f.kind == AdKind.REWARDED) return reject("激励视频，关闭会丢失奖励")
         if (f.kind == AdKind.PAID) return reject("付费 / 下载广告 CTA，点击等于打开广告")
         if (f.kind == AdKind.FEED) return reject("信息流广告，关闭按钮多半是「不感兴趣」")
@@ -64,10 +71,12 @@ object DecisionCore {
         if (f.sdkId) add(Weights.SDK_ID, "广告 SDK 控件 id")
         if (f.sdkClose) add(Weights.SDK_CLOSE, "SDK 关闭控件")
         if (f.explicitText) add(Weights.EXPLICIT_TEXT, "明确跳过 / 关闭文案")
+        if (f.remembered) add(Weights.MEMORY, "上次已验证生效的同一控件")
         if (f.scopedRule) add(Weights.SCOPED_RULE, "订阅作用域规则")
         if (f.globalRule) add(Weights.GLOBAL_RULE, "订阅全局规则")
         if (f.customRule) add(Weights.CUSTOM_RULE, "自定义关键词")
         if (f.coordinateRule) add(Weights.COORDINATE, "坐标兜底规则")
+        if (f.siblingIcon) add(Weights.SIBLING_ICON, "同容器无文字图标补位")
 
         if (f.inSplash) add(Weights.IN_SPLASH, "开屏时间窗内")
         if (f.freshWindow) reasons.add("新窗口会话")
@@ -92,7 +101,9 @@ object DecisionCore {
 
         if (!f.inSplash && !f.popupRound) add(Weights.OUTSIDE_WINDOW, "开屏时间窗之外")
         if (f.globalRule) add(Weights.GLOBAL_PENALTY, "全局规则未限定应用")
-        if (!f.sdkId && !f.sdkClose && !f.explicitText && !f.corner) {
+        if (!f.sdkId && !f.sdkClose && !f.explicitText && !f.corner && !f.siblingIcon &&
+            !f.remembered
+        ) {
             add(Weights.SOFT_ONLY, "缺少硬信号")
         }
 
@@ -155,6 +166,8 @@ object DecisionCore {
             f.globalRule -> "gkd_global:$tail"
             f.customRule -> "custom:${f.label.ifEmpty { tail }}"
             f.coordinateRule -> "coordinate:${f.left},${f.top}"
+            f.siblingIcon -> "sibling:${f.id.substringAfterLast('/').ifEmpty { tail }}"
+            f.remembered -> "memory:${f.id.substringAfterLast('/').ifEmpty { tail }}"
             else -> "none"
         }
     }

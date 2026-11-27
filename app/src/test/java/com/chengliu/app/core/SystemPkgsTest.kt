@@ -26,8 +26,8 @@ class SystemPkgsTest {
     @Test
     fun normalAppIsNotSkipped() {
         assertFalse(SystemPkgs.isSkip("com.tencent.mm"))
-        assertFalse(SystemPkgs.isSkip("com.coolapk.market"))
-        assertFalse(SystemPkgs.isSkip("tv.danmaku.bili"))
+        assertFalse(SystemPkgs.isSkip("com.example.appstore"))
+        assertFalse(SystemPkgs.isSkip("com.example.video"))
     }
 
     @Test

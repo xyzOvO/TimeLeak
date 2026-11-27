@@ -333,6 +333,11 @@ class AppPrefs(ctx: Context) {
 
     // ---------------- 跳过广告 · 高级（全部默认不改变既有行为） ----------------
 
+    /** 按上一轮命中的控件 id 直取节点（快路径）；关掉就回到完整遍历。 */
+    var skipFastPath: Boolean
+        get() = sp.getBoolean(KEY_SKIP_FAST, true)
+        set(v) = sp.edit().putBoolean(KEY_SKIP_FAST, v).apply()
+
     /** 跳过成功时弹一条轻提示；文案由 [skipToastText] 决定。 */
     var skipToast: Boolean
         get() = sp.getBoolean(KEY_SKIP_TOAST, true)
@@ -490,6 +495,7 @@ class AppPrefs(ctx: Context) {
         private const val KEY_RULE_ERROR = "rule_load_error"
         private const val KEY_SUB_AUTO_APPLY = "sub_auto_apply"
         private const val KEY_LAST_NETWORK = "last_network_at"
+        private const val KEY_SKIP_FAST = "skip_fast_path"
         private const val KEY_SKIP_TOAST = "skip_toast"
         private const val KEY_SKIP_TOAST_TEXT = "skip_toast_text"
         private const val KEY_GUARD_TITLE = "guard_title"

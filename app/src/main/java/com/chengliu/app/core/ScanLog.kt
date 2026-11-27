@@ -57,6 +57,14 @@ data class ScanBeat(
      * 真机上「节点树为空」那一轮也要 174ms，说明瓶颈不在匹配。
      */
     val treeMs: Int = 0,
+    /** 取树第一跳（窗口根节点）耗时，系统 API，优化碰不到。 */
+    val rootMs: Int = 0,
+    /** 本轮点击前二次验证的累计耗时。 */
+    val verifyMs: Int = 0,
+    /** 节点是不是「按 id 直取」拿到的。 */
+    val fast: Boolean = false,
+    /** 按 id 查询本身的耗时。 */
+    val idMs: Int = 0,
 )
 
 object ScanLog {

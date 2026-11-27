@@ -22,6 +22,18 @@ enum class HitReason {
     /** 用户自定义关键词等推断式匹配。 */
     TEXT_GUESS,
 
+    /**
+     * 同容器补位：文字候选点了没反应，改点同一个父容器里那个「无文字、窄、可点」的图标。
+     * 属于推断式证据，只在开了文本推断的策略档下才允许。
+     */
+    SIBLING_ICON,
+
+    /**
+     * 同一个控件上次已经点中并复核生效（记在 HitMemory 里）。
+     * 它省的是「重新认一遍」，不是跳过判定本身：仍然要过全部闸门与二次验证。
+     */
+    MEMORY,
+
     /** 按坐标点一下，风险最高。 */
     COORDINATE,
 }
@@ -109,6 +121,18 @@ object Weights {
     const val CUSTOM_RULE = 22
     const val COORDINATE = 8
 
+    /**
+     * 同容器无文字图标：开屏窗内 58 分，配合「窄控件 + 可点击 + 开屏窗内」
+     * 刚好过 70 分线；离开开屏窗就够不着，不会在普通页面上乱点图标。
+     */
+    const val SIBLING_ICON = 58
+
+    /**
+     * 记忆命中：上次在本应用点中、并且复核过「页面确实变了」的同一控件。
+     * 比补位图标可信（补位是推断，这条是实证），但依旧要配合窄控件 / 可点击 / 开屏窗内。
+     */
+    const val MEMORY = 62
+
     const val IN_SPLASH = 12
     const val NARROW = 8
     const val SHORT_TEXT = 5
@@ -166,6 +190,18 @@ data class NodeFacts(
     val sdkClose: Boolean = false,
     val explicitText: Boolean = false,
     val corner: Boolean = false,
+
+    /** 控件自己不可点、且唯一的可点祖先是整屏广告热区（疑似假按钮）。 */
+    val trapAncestor: Boolean = false,
+
+    /** 可点祖先覆盖屏幕的百分比，仅用于诊断与报告。 */
+    val ancestorAreaPct: Int = 0,
+
+    /** 同容器补位候选：没有文字、窄、可点的图标。 */
+    val siblingIcon: Boolean = false,
+
+    /** 这一条是 HitMemory 记住的、上次已验证生效的同一控件。 */
+    val remembered: Boolean = false,
     val scopedRule: Boolean = false,
     val globalRule: Boolean = false,
     val customRule: Boolean = false,

@@ -11,7 +11,10 @@ package com.chengliu.app.core
  *
  * 策略：
  * - 连续几轮什么都没点到 → 合并窗口 120 → 240 → 360 → 480ms 逐级退；
- * - 命中、换窗口、用户自己动手点/滑、或者正处在开屏窗 → 立刻回 120ms；
+ * - 命中、换窗口、用户自己动手点/滑 → 立刻回 120ms；
+ * - 开屏窗也退，但封在 splashMaxMs（默认 240ms）：开屏要速度，可也不能拿
+ *   「每秒扫八次、连扫十几秒」去换那几十毫秒。真机实测（某应用商店的信息流
+ *   视频页）开屏窗里 12 秒扫了近百次，其中一次候选都没有。
  * - 判据必须是「有没有点到」，不能是「有没有候选」：开屏广告页几乎每一轮都能
  *   数出几个窄小候选（倒计时、跳过、关闭），拿候选数当信号等于永远不复位，
  *   退避在真正需要它的页面上从不生效 —— 这是 v1.4.0 真机实测出来的。
@@ -22,6 +25,8 @@ class ScanPacer(
     private val baseMs: Long = 120L,
     private val stepMs: Long = 120L,
     private val maxMs: Long = 480L,
+    /** 开屏窗内允许的最大合并窗口：比普通页面小，比「不合并」慢得有限。 */
+    private val splashMaxMs: Long = 240L,
 ) {
     private var idle = 0
 
@@ -34,11 +39,12 @@ class ScanPacer(
     /**
      * 一轮扫描结束，按结果调整退避等级并返回下一次的合并窗口。
      * @param hit 这一轮是否真的点下去了（点了 / 按了返回）
-     * @param splash 这一轮是否处在开屏窗：开屏窗要速度，一律不复位也不增档
+     * @param splash 这一轮是否处在开屏窗：照样退避，但合并窗口封在 splashMaxMs
      */
     fun onScan(hit: Boolean, splash: Boolean): Long {
-        idle = if (hit || splash) 0 else (idle + 1).coerceAtMost(MAX_STEPS)
-        return mergeDelayMs
+        idle = if (hit) 0 else (idle + 1).coerceAtMost(MAX_STEPS)
+        val delay = mergeDelayMs
+        return if (splash) delay.coerceAtMost(splashMaxMs) else delay
     }
 
     /** 换窗口、用户操作、命中之后调用：立刻恢复灵敏。 */

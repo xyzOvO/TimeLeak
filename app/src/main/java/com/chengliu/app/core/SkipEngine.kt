@@ -520,7 +520,9 @@ object SkipEngine {
                 // 开屏角落里只有数字的圆形倒计时，也是明确的跳过按钮。
                 roundCountdown
             if (strong || reason == HitReason.SUBSCRIPTION ||
-                reason == HitReason.TEXT_GUESS || reason == HitReason.COORDINATE
+                reason == HitReason.TEXT_GUESS || reason == HitReason.COORDINATE ||
+                reason == HitReason.SIBLING_ICON ||
+                reason == HitReason.MEMORY
             ) return AdKind.SPLASH
         }
 

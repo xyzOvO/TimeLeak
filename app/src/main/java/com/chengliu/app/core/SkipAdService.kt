@@ -115,6 +115,29 @@ class SkipAdService : AccessibilityService() {
     /** 点击成功后进入冷却，同窗口内不再点；换窗口（fresh）时清零。 */
     private var cooldownUntil = 0L
 
+    // ---------------- 点击效果复核 ----------------
+    // 「点到了」和「跳过了」是两件事：performAction 返回 true 只说明控件接受了动作。
+    // 点击后隔 [EFFECT_CHECK_MS] 回来复核页面有没有真的变化，变了才算跳过成功。
+
+    /** 已发出、等待复核的那次点击。 */
+    private var pendingDecision: Decision? = null
+    private var pendingPkg: String? = null
+    private var pendingAct: String? = null
+    private var pendingViewId = ""
+    private var pendingKey = ""
+    private var pendingAt = 0L
+    private var pendingWindowAt = 0L
+    private var pendingVerifyMs = 0
+
+    /** 第一次复核还挂着控件时，是否已经放过宽限轮。 */
+    private var pendingGraceUsed = false
+
+    private val effectCheck = object : Runnable {
+        override fun run() {
+            verifyEffect()
+        }
+    }
+
     /** 本窗口是不是「从外部新进来的」，评分时用来决定是否重置冷却。 */
     private var windowFresh = false
 
@@ -124,6 +147,8 @@ class SkipAdService : AccessibilityService() {
     /** 安全观察模式缓存值，由 syncEngine() 跟随配置热更新。 */
     @Volatile
     private var observe = false
+    /** 快路径：按上一轮命中的控件 id 直取节点，省掉整棵树遍历。 */
+    private var fastPath = true
 
     /** 高级开关缓存：附加动作、圆形倒计时、手势兜底、跳过提示。每次事件同步一次。 */
     private var extraTeen = false
@@ -154,12 +179,17 @@ class SkipAdService : AccessibilityService() {
 
     /** 本轮扫描命中的规则名；扫描结束时用它把心跳结论标成「命中」。 */
     private var scanHitRule: String? = null
+    /** 本轮扫描里二次验证累计花掉的毫秒，只为诊断。 */
+    private var scanVerifyMs = 0
 
     /**
      * 空转退避：连续几轮扫不到任何候选，就把内容变化事件的合并窗口拉长。
      * 逻辑全在 [ScanPacer] 里（纯函数、可单测），这里只负责喂结果。
      */
     private val pacer = ScanPacer(SCAN_MERGE_MS, SCAN_MERGE_MS, SCAN_MERGE_MAX_MS)
+
+    /** 当前窗口有没有已经因为「内容变化」扫过一次：第一次立即扫，之后按退避走。 */
+    private var contentSeenInWindow = false
 
     /**
      * 桌面过渡期补扫状态。
@@ -362,10 +392,17 @@ class SkipAdService : AccessibilityService() {
                 // 120ms 内的连续变化只做一次全树遍历。开屏初期直接立即扫，
                 // 不再白等一整个合并窗口。
                 pendingScanPkg = pkg
+                // 同一条内容变化事件会被连发好几十次：先把上一次还没跑的补扫撤掉，
+                // 否则队列里攒一堆扫描，跑起来就是一串「扫完立刻再扫」。
                 handler.removeCallbacks(pendingScan)
-                // 开屏初期首个事件立即扫，不再白等一整个合并窗口。
-                // 其余情况用空转退避：连续扫不到候选时，窗口从 120ms 逐级拉到 480ms。
-                val mergeMs = if (inFastWindow(now)) SCAN_MERGE_FAST_MS else pacer.mergeDelayMs
+                // 开屏窗的第一次内容变化立即扫（抢首帧，真机实测这一步能压到十几毫秒），
+                // 之后的连续变化按空转退避走，开屏窗内封在 SPLASH_MERGE_MAX_MS。
+                val mergeMs = when {
+                    !inFastWindow(now) -> pacer.mergeDelayMs
+                    !contentSeenInWindow -> SCAN_MERGE_FAST_MS
+                    else -> pacer.mergeDelayMs.coerceAtMost(SPLASH_MERGE_MAX_MS)
+                }
+                contentSeenInWindow = true
                 handler.postDelayed(pendingScan, mergeMs)
             }
 
@@ -395,6 +432,8 @@ class SkipAdService : AccessibilityService() {
     private fun handleWindow(pkg: String, act: String, now: Long) {
         // 换窗口 = 新页面开局，空转退避清零，开屏窗必须立刻扫。
         pacer.reset()
+        // 新窗口的头一次内容变化仍然立即扫，别让上一个窗口的计数把首帧拖慢。
+        contentSeenInWindow = false
         // 新窗口已经在手上了，过渡期那次补扫就没意义了，先撤掉。
         handler.removeCallbacks(launcherRetry)
         launcherRetryPkg = null
@@ -572,6 +611,7 @@ class SkipAdService : AccessibilityService() {
         // 而不是排队堆起来——堆起来的每一轮都是几百毫秒的跨进程读。
         lastScanAt = now
         scanHitRule = null
+        scanVerifyMs = 0
         val startedAt = android.os.SystemClock.elapsedRealtime()
         scanDeadline = startedAt + SCAN_TIMEOUT_MS
         try {
@@ -591,6 +631,13 @@ class SkipAdService : AccessibilityService() {
         val now: Long,
         val startedAt: Long,
         val treeMs: Int,
+        val rootMs: Int,
+        /** 这一轮的节点是不是「按 id 直取」拿到的。 */
+        val fast: Boolean,
+        /** 按 id 查询本身花掉的时间。 */
+        val idMs: Int,
+        /** 这一轮命中的 viewId；没走快路径时为空串。 */
+        val fastId: String,
         val realPkg: String,
         val screen: Rect,
         val refs: List<Ref>,
@@ -608,6 +655,10 @@ class SkipAdService : AccessibilityService() {
         val deadline = startedAt + SCAN_TIMEOUT_MS
         scanNodes.clear()
         var treeMs = 0
+        var rootMs = 0
+        var fast = false
+        var fastId = ""
+        var idMs = 0
         var realPkg = pkg
         var screen = Rect(0, 0, 0, 0)
         val refs = ArrayList<Ref>(64)
@@ -625,6 +676,9 @@ class SkipAdService : AccessibilityService() {
                 realPkg = root.packageName?.toString() ?: pkg
                 val dm = resources.displayMetrics
                 screen = Rect(0, 0, dm.widthPixels, dm.heightPixels)
+                // 取树的第一跳（拿窗口根节点）单独计时：那是系统 API，不归我们控制，
+                // 能优化的只有后面的遍历，所以两者必须分开记。
+                rootMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
                 when {
                     realPkg == packageName || isSkipPkg(realPkg) -> {
                         abortResult = BeatResult.SELF
@@ -644,7 +698,49 @@ class SkipAdService : AccessibilityService() {
                         abortResult = BeatResult.POLICY
                         abortNote = "应用策略为不自动点击"
                     }
-                    else -> collect(root, refs, 0, screen, deadline, 0)
+                    else -> {
+                        // 快路径：上一轮在这一页点中过某个控件，就直接按它的 viewId 问系统要节点，
+                        // 省掉「把整棵树每个节点的属性都读一遍」那一段（真机实测 ~110ms）。
+                        // 拿到的仍是真节点，照样要过 click() 里的全部闸门与二次验证——
+                        // 这条路径省的是「找」，不是「验」。
+                        val hinted = if (fastPath) HitMemory.viewIdFor(realPkg) else null
+                        // 记住的控件如果刚被判定过「点了没反应」，这一轮别再用它：
+                        // 老实扫全树，让补位逻辑去同容器里找那个真能用的。
+                        val remembered = hinted?.takeUnless {
+                            DeadTargets.isDead(realPkg, it, System.currentTimeMillis())
+                        }
+                        if (remembered != null) {
+                            val idStart = android.os.SystemClock.elapsedRealtime()
+                            val found = runCatching {
+                                root.findAccessibilityNodeInfosByViewId(remembered)
+                            }.getOrNull()
+                            idMs = (android.os.SystemClock.elapsedRealtime() - idStart).toInt()
+                            val hit = found?.firstOrNull { it.isVisibleToUser }
+                            // 同一个 id 可能命中多个节点（隐藏的兄弟控件）。
+                            // 除了要给 click() 用的那一个，其余立刻还回去，否则句柄会攒着。
+                            found?.forEach { if (it !== hit) recycleNode(it) }
+                            val ref = if (hit == null) {
+                                null
+                            } else {
+                                scanNodes.add(hit)
+                                refOf(hit, scanNodes.size - 1, screen)
+                            }
+                            if (ref != null) {
+                                refs.add(ref)
+                                fast = true
+                                fastId = remembered
+                            } else {
+                                // 这一轮没拿到，不等于 id 失效：开屏按钮常常是「还没渲染出来」
+                                // 或者「刚被我们点掉」。真机实测（某长视频应用）：点中之后再查这个 id
+                                // 就一个节点都查不到了，如果在这里忘掉，下次冷启动永远用不上记忆。
+                                // 所以记忆只当提示用：查不到就老实走完整扫描，条目不删，
+                                // 等下一次点中别的控件时自然覆盖。
+                                collect(root, refs, 0, screen, deadline, 0)
+                            }
+                        } else {
+                            collect(root, refs, 0, screen, deadline, 0)
+                        }
+                    }
                 }
                 treeMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
             }
@@ -662,6 +758,10 @@ class SkipAdService : AccessibilityService() {
             now = now,
             startedAt = startedAt,
             treeMs = treeMs,
+            rootMs = rootMs,
+            fast = fast,
+            idMs = idMs,
+            fastId = fastId,
             realPkg = realPkg,
             screen = screen,
             refs = refs,
@@ -679,13 +779,19 @@ class SkipAdService : AccessibilityService() {
 
     /** 扫描的第二段（主线程）：树已经取好，这里做策略、匹配、点击，并统一收尾。 */
     private fun finishScan(t: TreeRead) {
-        val now = t.now
+        // 用「此刻」而不是派发时刻：取树在 worker 上跑，回来时 windowAt 可能已经被新的
+        // 窗口事件重置过，拿派发时刻算年龄会得到负数（真机日志出现过 开屏窗=-1ms）。
+        // 必须与 windowAt 同源（System.currentTimeMillis），不能用 elapsedRealtime。
+        val now = System.currentTimeMillis()
         val realPkg = t.realPkg
         val refs = t.refs
         val screen = t.screen
         val force = t.force
         val startedAt = t.startedAt
         val treeMs = t.treeMs
+        val rootMs = t.rootMs
+        val fast = t.fast
+        val idMs = t.idMs
         var beatPkg = realPkg
         // 心跳结论先按「扫完未命中」兜底，各分支只负责改写它。
         var beatStage = BeatStage.NORMAL
@@ -763,7 +869,8 @@ class SkipAdService : AccessibilityService() {
             android.util.Log.i(
                 "SkipAd",
                 "扫描 $realPkg 节点=${refs.size} 开屏窗=${windowAge}ms 策略=${policy.mode} " +
-                    "取树=${treeMs}ms force=$force",
+                    "取树=${treeMs}ms（根=${rootMs} 遍历=${treeMs - rootMs} 快路径=$fast 按id=${idMs}ms）" +
+                        "force=$force",
             )
             nodeCount = refs.size
             // 附加动作（青少年弹窗 / 微信原图）默认全关，开关没开时一行退出、零开销。
@@ -832,7 +939,15 @@ class SkipAdService : AccessibilityService() {
 
             // 文本推断轮：只认「窄控件」—— 整行宽的列表项、卡片上写着「跳过」
             // 时那是用户要点的功能，不是广告入口。
-            for (r in refs) {
+            // 顺序不是遍历顺序：一屏真假两个「跳过」时，先试更像真按钮的那个
+            // （自身可点、面积小、贴近屏幕角）。
+            for (r in HitRanker.order(refs, ::rankKey)) {
+                // 记忆命中优先：这一条是上次真正点掉过广告的控件，只是它常常没有文字
+                // （有的应用把真按钮做成一个无字图标），靠文案匹配永远轮不到它。
+                if (t.fastId.isNotEmpty() && r.id == t.fastId) {
+                    if (click(r, now, HitReason.MEMORY)) return
+                    continue
+                }
                 if (r.text.isEmpty() && r.desc.isEmpty() && r.id.isEmpty()) continue
                 if (r.bounds.width() >= screen.width() * NARROW_RATIO) continue
                 if (!SkipEngine.isSafeTarget(r.text, r.desc)) continue
@@ -858,7 +973,10 @@ class SkipAdService : AccessibilityService() {
             val costMs = (android.os.SystemClock.elapsedRealtime() - startedAt).toInt()
             // 空转退避只认一个事实：这一轮有没有真的点下去。
             pacer.onScan(scanHitRule != null, scanInSplash)
-            beat(now, beatPkg, nodeCount, candidateCount, beatStage, beatResult, beatNote, costMs, treeMs)
+            beat(
+                now, beatPkg, nodeCount, candidateCount, beatStage, beatResult, beatNote,
+                costMs, treeMs, rootMs, scanVerifyMs, fast, idMs,
+            )
             // 扫描完成：把本次持有的所有节点引用一次性释放。
             // AccessibilityNodeInfo 是跨进程句柄，不能当普通对象缓存到下一轮。
             for (n in scanNodes) recycleNode(n)
@@ -878,6 +996,10 @@ class SkipAdService : AccessibilityService() {
         note: String,
         costMs: Int = 0,
         treeMs: Int = 0,
+        rootMs: Int = 0,
+        verifyMs: Int = 0,
+        fast: Boolean = false,
+        idMs: Int = 0,
     ) {
         // 切回自己时的那一轮没有任何信息量，界面里不出现，logcat 仍有窗口日志。
         if (result == BeatResult.SELF) return
@@ -893,6 +1015,10 @@ class SkipAdService : AccessibilityService() {
                 note = note,
                 costMs = costMs,
                 treeMs = treeMs,
+                rootMs = rootMs,
+                verifyMs = verifyMs,
+                fast = fast,
+                idMs = idMs,
             ),
         )
     }
@@ -908,7 +1034,7 @@ class SkipAdService : AccessibilityService() {
      * 但仍要求控件够小且是窄控件。
      */
     private fun scanExplicit(refs: List<Ref>, screen: Rect, now: Long): Boolean {
-        for (r in refs) {
+        for (r in HitRanker.order(refs, ::rankKey)) {
             if (r.bounds.width() >= screen.width() * NARROW_RATIO) continue
             if (!SkipEngine.isSafeTarget(r.text, r.desc)) continue
             val s = r.text.ifEmpty { r.desc }
@@ -1136,6 +1262,23 @@ class SkipAdService : AccessibilityService() {
      * 每个遍历到的节点都登记进 [scanNodes]（扫描结束统一 recycle），
      * Ref 只保存它的下标和纯数据，不持有节点本身。
      */
+    /**
+     * 把一个节点读成 [Ref]：只读判定真的会用到的那几项。
+     * 三样文本全空、不可见、尺寸为零、或不在屏幕内的节点返回 null。
+     */
+    private fun refOf(node: AccessibilityNodeInfo, index: Int, screen: Rect): Ref? {
+        val text = node.text?.toString()?.trim().orEmpty()
+        val desc = node.contentDescription?.toString()?.trim().orEmpty()
+        val id = node.viewIdResourceName ?: ""
+        if (text.isEmpty() && desc.isEmpty() && id.isEmpty()) return null
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (!node.isVisibleToUser || rect.width() <= 0 || rect.height() <= 0) return null
+        if (!Rect.intersects(rect, screen)) return null
+        val cls = if (SkipEngine.needsClass) node.className?.toString()?.trim().orEmpty() else ""
+        return Ref(index, text, desc, id, rect, cls, node.isClickable)
+    }
+
     private fun collect(
         node: AccessibilityNodeInfo?,
         out: MutableList<Ref>,
@@ -1150,13 +1293,14 @@ class SkipAdService : AccessibilityService() {
         val text = node.text?.toString()?.trim().orEmpty()
         val desc = node.contentDescription?.toString()?.trim().orEmpty()
         val id = node.viewIdResourceName ?: ""
-        // className 每读一次就是一次跨进程调用，一屏几百个节点下来很可观；
-        // 而只有订阅里写了 [name="..."] 时才会有人用它，所以按需读。
-        val cls = if (SkipEngine.needsClass) node.className?.toString()?.trim().orEmpty() else ""
-        val clickable = node.isClickable
-        val rect = Rect()
-        node.getBoundsInScreen(rect)
+        // 剩下的属性每读一次都是一次跨进程往返。一屏里占大多数的纯容器节点
+        // （三个文本都空）根本不会生成 Ref，读了也没人用——所以全部挪进判空里。
         if (text.isNotEmpty() || desc.isNotEmpty() || id.isNotEmpty()) {
+            // className 只有订阅里写了 [name="..."] 时才会有人用，按需读。
+            val cls = if (SkipEngine.needsClass) node.className?.toString()?.trim().orEmpty() else ""
+            val clickable = node.isClickable
+            val rect = Rect()
+            node.getBoundsInScreen(rect)
             // 不可见的节点永远不点：广告 SDK 常放一个 0×0 或屏幕外的假跳过按钮
             if (node.isVisibleToUser && rect.width() > 0 && rect.height() > 0 &&
                 Rect.intersects(rect, screen)
@@ -1181,6 +1325,69 @@ class SkipAdService : AccessibilityService() {
      * 多条件评分 -> 广告类型 -> 应用策略 -> 冷却 -> 观察模式。
      * 观察模式下这里会完整识别并记录，但永远不执行任何点击 / 返回键。
      */
+    /**
+     * 点击前的「目标探测」结果：谁会被真正点到、它有多大。
+     * node 为 null 表示整条祖先链都不可点。
+     */
+    private class ClickProbe(
+        val node: AccessibilityNodeInfo?,
+        val selfClickable: Boolean,
+        val w: Int,
+        val h: Int,
+        val areaPct: Int,
+    )
+
+    /**
+     * 找出点击真正会落到的节点，并量它的面积占比。
+     *
+     * 跳过按钮常见两种形态：自己可点的 TextView/ImageView，或者包在
+     * FrameLayout 里不可点、由父容器响应点击。两种都允许，但如果可点的
+     * 那一层是整屏广告图，那它不是跳过按钮，是广告热区。
+     *
+     * 只读不点；拿到的父节点登记进 [scanNodes]，由扫描结束统一回收。
+     */
+    private fun probeClickTarget(start: AccessibilityNodeInfo): ClickProbe {
+        val self = start.isClickable && start.isEnabled
+        if (self) {
+            val r = Rect()
+            start.getBoundsInScreen(r)
+            return ClickProbe(
+                start, true, r.width(), r.height(),
+                (HitGeometry.areaRatio(r.width(), r.height(), scanScreenW, scanScreenH) * 100).toInt(),
+            )
+        }
+        var cur: AccessibilityNodeInfo? = start
+        var depth = 0
+        while (cur != null && depth <= 3) {
+            if (cur.isClickable && cur.isEnabled) {
+                val r = Rect()
+                cur.getBoundsInScreen(r)
+                return ClickProbe(
+                    cur, false, r.width(), r.height(),
+                    (HitGeometry.areaRatio(r.width(), r.height(), scanScreenW, scanScreenH) * 100).toInt(),
+                )
+            }
+            val parent = cur.parent
+            if (parent != null) scanNodes.add(parent)
+            cur = parent
+            depth++
+        }
+        return ClickProbe(null, false, 0, 0, 0)
+    }
+
+    /** 排序用的轻量键：只读扫描阶段已有的纯数据，不额外跨进程。 */
+    private fun rankKey(r: Ref): HitRanker.RankKey = HitRanker.RankKey(
+        clickable = r.clickable,
+        width = r.bounds.width(),
+        height = r.bounds.height(),
+        left = r.bounds.left,
+        top = r.bounds.top,
+        right = r.bounds.right,
+        bottom = r.bounds.bottom,
+        screenW = scanScreenW,
+        screenH = scanScreenH,
+    )
+
     private fun click(ref: Ref, now: Long, reason: HitReason, round: Boolean = false): Boolean {
         // 倒计时文本每秒都在变（"跳过 5s" -> "跳过 4s"），直接拿原文当 key
         // 等于没有判重。去掉数字和空白后才是同一个控件；再带上位置，
@@ -1194,6 +1401,20 @@ class SkipAdService : AccessibilityService() {
             base, ref.bounds.left, ref.bounds.top,
             lastClickBase, lastClickLeft, lastClickTop,
         )
+        // 上次点了这个控件、页面却纹丝不动 —— 不在它身上浪费额度，
+        // 改试同一个父容器里那个「没有文字、窄、可点」的图标（真跳过常常就是这种图标）。
+        if (!observe && DeadTargets.isDead(policyPkg, ref.id, now)) {
+            val icon = iconSiblingRef(ref)
+            if (icon != null) {
+                android.util.Log.i(
+                    "SkipAd",
+                    "补位: ${ref.id.ifEmpty { "无 id 文本候选" }} 已判无效，改试同容器图标 " +
+                        icon.id.ifEmpty { "${icon.bounds.left},${icon.bounds.top}" },
+                )
+                if (click(icon, now, HitReason.SIBLING_ICON, round)) return true
+            }
+            return false
+        }
         if (!observe) {
             if (sessionClicks >= MAX_SESSION_CLICKS) return false
             if ((clickCounts[key] ?: 0) >= MAX_SAME_CLICKS) return false
@@ -1201,6 +1422,12 @@ class SkipAdService : AccessibilityService() {
             if (sessionClicks >= 1 && key != lastClickKey && !sameAsLast) return false
             if (now - lastClickAt < CLICK_GAP_MS) return false
         }
+
+        // 判定之前先摸清「真正会被点到的是谁」：控件自己可点就用它，
+        // 否则向上找 ≤3 层第一个可点祖先，并量出它的面积占比。
+        // 只读不点 —— 判定通过之后才在这个节点上 performAction。
+        val node = scanNodes.getOrNull(ref.nodeIndex) ?: return false
+        val probe = probeClickTarget(node)
 
         val b = ref.bounds
         val label = ref.text.ifEmpty { ref.desc }
@@ -1242,6 +1469,14 @@ class SkipAdService : AccessibilityService() {
             ) != null,
             globalRule = SkipEngine.globalHit(ref.text, ref.desc, ref.id, age, ref.cls),
             customRule = SkipEngine.customHit(ref.text, ref.desc, ref.id, ref.cls),
+            trapAncestor = HitGeometry.isTrapAncestor(
+                probe.selfClickable, probe.w, probe.h, scanScreenW, scanScreenH,
+            ),
+            ancestorAreaPct = probe.areaPct,
+            siblingIcon = reason == HitReason.SIBLING_ICON,
+            // 记忆命中的是「上次点中并复核生效的同一个控件」，要把这条证据带进判定，
+            // 否则它只是一个没有文字、没有规则的节点，分数永远过不了线（真机踩过）。
+            remembered = reason == HitReason.MEMORY,
             coordinateRule = SkipEngine.boundsHit(b),
             cooldownActive = now < cooldownUntil,
             observe = observe,
@@ -1318,11 +1553,15 @@ class SkipAdService : AccessibilityService() {
         // 二次验证：扫描 → 判定 → 真正下手之间可能隔了几十毫秒，
         // 倒计时刷新、页面跳转、弹窗自动消失都可能发生。
         // 只信扫描时那份快照，等于闭着眼睛按坐标。
-        val node = scanNodes.getOrNull(ref.nodeIndex) ?: return false
         val fresh = Rect()
+        // 二次验证要再向系统要一次窗口根节点，是实打实的主线程跨进程往返。
+        // 单独计时，才知道「能不能省掉这一跳」值不值得讨论。
+        val verifyAt = android.os.SystemClock.elapsedRealtime()
         val denied = verifyBeforeClick(ref, node, fresh)
+        val verifyMs = (android.os.SystemClock.elapsedRealtime() - verifyAt).toInt()
+        scanVerifyMs += verifyMs
         if (denied != null) {
-            android.util.Log.i("SkipAd", "二次验证未通过: $denied")
+            android.util.Log.i("SkipAd", "二次验证未通过（验证=${verifyMs}ms）: $denied")
             RejectLog.add(
                 Reject(
                     at = now,
@@ -1339,21 +1578,17 @@ class SkipAdService : AccessibilityService() {
             return false
         }
 
-        // 自己可点就点，不可点就向上找可点击祖先（很多跳过按钮是 FrameLayout 里的 TextView）
-        var cur: AccessibilityNodeInfo? = node
-        var depth = 0
-        while (cur != null && depth <= 3) {
-            if (cur.isClickable && cur.isEnabled &&
-                cur.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            ) {
-                mark(key, base, ref.bounds.left, ref.bounds.top, now, d)
-                return true
-            }
-            val parent = cur.parent
-            // parent 也是本次扫描拿到的引用，登记后由 finally 统一释放。
-            if (parent != null) scanNodes.add(parent)
-            cur = parent
-            depth++
+        // 点 probe 在判定前就找好的那个节点（自己或 ≤3 层内的可点祖先），
+        // 不再重新向上走一遍：同一棵树走两次，第二次还可能走到别的地方去。
+        val target = probe.node
+        if (target != null && target.isClickable && target.isEnabled &&
+            target.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        ) {
+            mark(
+                key, base, ref.bounds.left, ref.bounds.top, now, d,
+                verifyMs = verifyMs, viewId = ref.id,
+            )
+            return true
         }
 
         // 控件本身与可点击祖先都点不动时，退化成按坐标点一下。
@@ -1367,7 +1602,10 @@ class SkipAdService : AccessibilityService() {
                 .build()
             lastGestureAt = now
             if (dispatchGesture(gesture, null, null)) {
-                mark(key, base, ref.bounds.left, ref.bounds.top, now, d)
+                mark(
+                    key, base, ref.bounds.left, ref.bounds.top, now, d,
+                    verifyMs = verifyMs, viewId = ref.id,
+                )
                 return true
             }
         }
@@ -1452,6 +1690,8 @@ class SkipAdService : AccessibilityService() {
     private fun mark(
         key: String, base: String, left: Int, top: Int, now: Long, d: Decision,
         ad: Boolean = true,
+        verifyMs: Int = 0,
+        viewId: String = "",
     ) {
         scanHitRule = d.rule
         lastClickKey = key
@@ -1467,16 +1707,159 @@ class SkipAdService : AccessibilityService() {
         // 否则 freshWindow 会一直为 true，把冷却判定在决策层抵消掉。
         windowFresh = false
         evidence.clear()
-        // 附加动作借的是冷却 / 去重 / 会话上限，不是广告统计与提示。
+        // 「点到了」不等于「跳过了」：performAction 返回 true 只代表控件接受了动作，
+        // 页面有没有变化完全是另一回事（有的应用把「跳过广告1」做成点了没反应的假标签）。
+        // 所以这里只把复核排进队列 —— 统计、提示、记 id 全部挪到 confirmSkip()。
         if (ad) {
-            prefs.bumpSkip()
-            showSkipToast(now)
+            armEffectCheck(d, viewId, verifyMs, now)
         }
         android.util.Log.i(
             "SkipAd",
-            "已点击${if (ad) "跳过" else "附加动作"}: $key 分数=${d.score} ${d.level.label} " +
-                "规则=${d.rule} 耗时=${now - windowAt}ms 冷却=2s",
+            "点击已发出（待校验）${if (ad) "跳过" else "附加动作"}: $key 分数=${d.score} ${d.level.label} " +
+                "规则=${d.rule} 耗时=${now - windowAt}ms 验证=${verifyMs}ms 冷却=2s",
         )
+    }
+
+    /** 把这次点击登记为「待复核」，[EFFECT_CHECK_MS] 后回来看看页面变没变。 */
+    private fun armEffectCheck(d: Decision, viewId: String, verifyMs: Int, now: Long) {
+        pendingDecision = d
+        pendingPkg = policyPkg
+        pendingAct = curAct
+        pendingViewId = viewId
+        pendingKey = lastClickKey
+        pendingAt = now
+        pendingWindowAt = windowAt
+        pendingVerifyMs = verifyMs
+        pendingGraceUsed = false
+        handler.removeCallbacks(effectCheck)
+        handler.postDelayed(effectCheck, EFFECT_CHECK_MS)
+    }
+
+    /**
+     * 复核点击效果：控件还在、窗口没动 → 这次点击白点了。
+     *
+     * 判据全部来自「系统给的现在的状态」，不看我们自己的日志：
+     *  1. 同一个 viewId 的控件是否还可见；
+     *  2. 前台 Activity / 包名是否变了；
+     *  3. 期间是否有新的窗口事件。
+     */
+    private fun verifyEffect() {
+        val d = pendingDecision ?: return
+        val viewId = pendingViewId
+        val now = System.currentTimeMillis()
+
+        var stillVisible: Boolean? = null
+        if (viewId.isNotEmpty()) {
+            val root = runCatching { rootInActiveWindow }.getOrNull()
+            if (root != null) {
+                val found = runCatching {
+                    root.findAccessibilityNodeInfosByViewId(viewId)
+                }.getOrNull()
+                stillVisible = found?.any { runCatching { it.isVisibleToUser }.getOrDefault(false) } ?: false
+                found?.forEach { recycleNode(it) }
+            }
+        }
+
+        val changed = EffectVerdict.judge(
+            stillVisible = stillVisible,
+            actChanged = curAct != pendingAct,
+            pkgChanged = curPkg != pendingPkg,
+            windowAdvanced = windowAt > pendingWindowAt,
+        )
+        if (changed) {
+            pendingDecision = null
+            confirmSkip(d, viewId, now, pendingVerifyMs)
+            return
+        }
+        if (!pendingGraceUsed) {
+            pendingGraceUsed = true
+            handler.postDelayed(effectCheck, EFFECT_GRACE_MS)
+            return
+        }
+
+        // 两次复核都没变化：这次点击无效。
+        // 不弹提示、不记统计、不占「每次会话两次点击」的额度，并把控件拉黑。
+        pendingDecision = null
+        sessionClicks = (sessionClicks - 1).coerceAtLeast(0)
+        cooldownUntil = 0L
+        DeadTargets.remember(pendingPkg, viewId, now)
+        android.util.Log.i(
+            "SkipAd",
+            "点击无效: $pendingKey 复核 ${EFFECT_CHECK_MS}+${EFFECT_GRACE_MS}ms 页面无变化，已拉黑该控件",
+        )
+        RejectLog.add(
+            Reject(
+                at = now,
+                pkg = pendingPkg ?: "",
+                appLabel = labelOf(pendingPkg ?: ""),
+                target = pendingKey.ifEmpty { viewId },
+                level = d.level,
+                kind = d.kind,
+                action = DecisionAction.SKIP,
+                rule = d.rule,
+                reason = "点击无效：页面无变化（疑为假按钮）",
+            ),
+        )
+        // 立刻补扫一次，让补位逻辑接上（这次会走 iconSiblingRef）。
+        val pkg = pendingPkg ?: policyPkg
+        handler.post {
+            if (pkg.isNotEmpty()) scan(pkg, curAct, force = true)
+        }
+    }
+
+    /** 复核确认页面真的变了，这才是「跳过成功」：统计、提示、记 id 都从这里发。 */
+    private fun confirmSkip(d: Decision, viewId: String, now: Long, verifyMs: Int) {
+        prefs.bumpSkip()
+        showSkipToast(now)
+        HitMemory.remember(pendingPkg ?: policyPkg, viewId)
+        android.util.Log.i(
+            "SkipAd",
+            "跳过生效: $pendingKey 分数=${d.score} 规则=${d.rule} " +
+                "复核=${now - pendingAt}ms 验证=${verifyMs}ms",
+        )
+    }
+
+    /**
+     * 在失效候选的同一个父容器里，找一个「没有文字、窄、可点」的图标当补位候选。
+     *
+     * 只用来救一种情况：文字候选点了没反应，而真正的跳过是紧挨着它的无字图标。
+     * 找到的节点同样进 [scanNodes] 交给统一回收，判定也照走
+     * classify + DecisionCore + verifyBeforeClick 三道闸，不额外放行。
+     */
+    private fun iconSiblingRef(ref: Ref): Ref? {
+        val node = scanNodes.getOrNull(ref.nodeIndex) ?: return null
+        val parent = runCatching { node.parent }.getOrNull() ?: return null
+        val screen = Rect(0, 0, scanScreenW, scanScreenH)
+        val maxW = (scanScreenW * SIBLING_MAX_WIDTH_RATIO).toInt()
+        var picked: AccessibilityNodeInfo? = null
+        try {
+            for (i in 0 until parent.childCount) {
+                val child = runCatching { parent.getChild(i) }.getOrNull() ?: continue
+                val usable = runCatching {
+                    child != node && child.isClickable && child.isVisibleToUser &&
+                        child.text.isNullOrEmpty() && child.contentDescription.isNullOrEmpty() &&
+                        !child.viewIdResourceName.isNullOrEmpty()
+                }.getOrDefault(false)
+                if (!usable) {
+                    recycleNode(child)
+                    continue
+                }
+                val r = Rect()
+                runCatching { child.getBoundsInScreen(r) }
+                val fits = r.width() in 1..maxW && r.height() > 0 &&
+                    scanScreenW > 0 && Rect.intersects(r, screen)
+                if (fits && picked == null) {
+                    picked = child
+                } else {
+                    recycleNode(child)
+                }
+            }
+            val hit = picked ?: return null
+            scanNodes.add(hit)
+            return refOf(hit, scanNodes.size - 1, screen)
+        } finally {
+            recycleNode(parent)
+        }
     }
 
     /** 跳过成功的轻提示：文案可自定义，800ms 内不重复弹，避免同窗口连点刷屏。 */
@@ -1494,6 +1877,7 @@ class SkipAdService : AccessibilityService() {
     /** 开关类配置每次事件同步一次，服务进程内不反复读 SharedPreferences。 */
     private fun syncFlags() {
         observe = prefs.observeMode
+        fastPath = prefs.skipFastPath
         ExtraRules.roundEnabled = prefs.roundCountdown
         extraTeen = prefs.teenPopup
         extraWechat = prefs.wechatOriginal
@@ -1552,6 +1936,8 @@ class SkipAdService : AccessibilityService() {
         // 授权还在、服务却断了 —— 多半是省电策略把服务冻住了。
         // 只提醒一次，不尝试后台重启（系统不允许），更不弹系统授权窗口。
         handler.removeCallbacks(launcherRetry)
+        handler.removeCallbacks(effectCheck)
+        pendingDecision = null
         scanWorker.shutdownNow()
         ServiceRecovery.warnAccessibility(this)
         android.util.Log.i("SkipAd", "无障碍服务已断开")
@@ -1597,11 +1983,23 @@ class SkipAdService : AccessibilityService() {
         /** 两次点击之间的最小间隔。 */
         const val CLICK_GAP_MS = 800L
 
+        /** 点击之后隔多久回来复核「页面真的变了吗」。 */
+        const val EFFECT_CHECK_MS = 600L
+
+        /** 有的开屏是淡出动画，第一次复核控件还挂着就再等这么久。 */
+        const val EFFECT_GRACE_MS = 800L
+
+        /** 同容器补位候选（无文字图标）的最大宽度占屏比。 */
+        const val SIBLING_MAX_WIDTH_RATIO = 0.45f
+
         /** 内容变化事件合并窗口：120ms 内的连续变化只遍历一次节点树。 */
         const val SCAN_MERGE_MS = 120L
 
         /** 开屏初期按钮刚渲染，首个事件立即扫描，不额外等待合并窗口。 */
         const val SCAN_MERGE_FAST_MS = 0L
+
+        /** 开屏窗内容变化的合并上限：既保住首帧，也别每秒扫八次扫满整段开屏。 */
+        const val SPLASH_MERGE_MAX_MS = 240L
 
         /**
          * 空转退避的上限：连续扫不到候选时，合并窗口最多拉长到这里。

@@ -1722,6 +1722,7 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
     // ---------------- 高级（默认折叠，不新增页面、不占主界面） ----------------
     var showAdvanced by remember { mutableStateOf(false) }
     var gestureFallback by remember { mutableStateOf(prefs.gestureFallback) }
+    var fastPath by remember { mutableStateOf(prefs.skipFastPath) }
     var roundCountdown by remember { mutableStateOf(prefs.roundCountdown) }
     var skipToast by remember { mutableStateOf(prefs.skipToast) }
     var toastText by remember { mutableStateOf(prefs.skipToastText) }
@@ -2565,6 +2566,12 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                 "控件自身点不动时，按坐标补一次手势点击；仍然走原来的广告判定与二次验证",
                 gestureFallback,
             ) { gestureFallback = it; prefs.gestureFallback = it }
+            ToggleLine(
+                "按 id 直取跳过按钮",
+                "记住上次点中的控件 id，下次开屏直接定位它，不再遍历整棵节点树（约 110ms）；" +
+                    "取到的仍是真节点，判定与二次验证一步不少。异常时关掉即回到完整扫描",
+                fastPath,
+            ) { fastPath = it; prefs.skipFastPath = it }
             ToggleLine(
                 "识别圆形倒计时按钮",
                 "开屏角落只有「3」「3s」的圆形跳过按钮，按内置强信号识别；不是自绘坐标点击",

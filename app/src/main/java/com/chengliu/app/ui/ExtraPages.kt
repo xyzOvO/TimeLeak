@@ -622,7 +622,12 @@ private fun BeatRow(b: ScanBeat) {
                     if (isNotEmpty()) append(" · ")
                     append("耗时 ${b.costMs}ms")
                     if (b.treeMs in 1 until b.costMs) {
-                        append("（取树 ${b.treeMs} · 匹配 ${b.costMs - b.treeMs}）")
+                        append("（取树 ${b.treeMs}")
+                        if (b.rootMs in 1 until b.treeMs) append(" = 根 ${b.rootMs} + 遍历 ${b.treeMs - b.rootMs}")
+                        append(" · 匹配 ${b.costMs - b.treeMs}")
+                        if (b.fast) append(" · 按id ${b.idMs}ms")
+                        if (b.verifyMs > 0) append(" · 验证 ${b.verifyMs}")
+                        append("）")
                     }
                 }
             }.ifEmpty { "未进入扫描" },

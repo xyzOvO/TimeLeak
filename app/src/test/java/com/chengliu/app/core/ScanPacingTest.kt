@@ -42,10 +42,26 @@ class ScanPacingTest {
     }
 
     @Test
-    fun splashWindowNeverBacksOff() {
-        // 开屏窗要速度：不拿广告速度换省电
+    fun splashWindowBacksOffOnlyToItsCap() {
+        // 开屏窗照样退避，但封在 240ms：连续空扫不会退到 480ms
         val p = ScanPacer()
-        repeat(6) { assertEquals(120L, p.onScan(false, true)) }
+        repeat(6) { assertEquals(240L, p.onScan(false, true)) }
+        assertTrue("开屏窗也要记空转轮数", p.idleStreak > 0)
+        assertEquals(480L, p.mergeDelayMs)
+    }
+
+    @Test
+    fun splashCapIsConfigurable() {
+        val p = ScanPacer(splashMaxMs = 100L)
+        assertEquals(100L, p.onScan(false, true))
+    }
+
+    @Test
+    fun splashHitStillResetsEverything() {
+        val p = ScanPacer()
+        p.onScan(false, true)
+        p.onScan(false, true)
+        assertEquals(120L, p.onScan(true, true))
         assertEquals(0, p.idleStreak)
     }
 
