@@ -180,9 +180,62 @@ class DohResolver(
         return null
     }
 
+    /**
+     * 一条已经握手完成的隧道。DoH 上游每查一次就新建 TCP + TLS（2~3 个 RTT，
+     * 还要多一次完整握手），在「每个 DNS 包」的频次上这是最贵的一项开销，
+     * 所以把空闲连接留下来复用，超过 [keepAliveMs] 或出任何 IO 异常就丢弃重建。
+     */
+    private class Path(val socket: SSLSocket, val ip: String, val at: Long)
+
+    private val keepAliveMs = 25_000L
+    private var path: Path? = null
+    private val pathLock = Any()
+
+    private fun closeQuietly(s: java.io.Closeable?) {
+        runCatching { s?.close() }
+    }
+
+    private fun takePath(ip: String): SSLSocket? = synchronized(pathLock) {
+        val p = path ?: return@synchronized null
+        path = null
+        if (p.ip != ip || p.socket.isClosed || System.currentTimeMillis() - p.at > keepAliveMs) {
+            closeQuietly(p.socket)
+            null
+        } else {
+            p.socket
+        }
+    }
+
+    private fun offerPath(ip: String, socket: SSLSocket) {
+        synchronized(pathLock) {
+            closeQuietly(path?.socket)
+            path = Path(socket, ip, System.currentTimeMillis())
+        }
+    }
+
     private fun postViaTls(ip: String, msg: ByteArray, len: Int): ByteArray? {
+        val cached = takePath(ip)
+        if (cached != null) {
+            val body = exchange(cached, msg, len)
+            if (body != null) {
+                offerPath(ip, cached)
+                return body
+            }
+            // 复用的隧道多半已被服务端关掉：丢掉它，重新握一次手。
+            closeQuietly(cached)
+        }
+        val fresh = openTls(ip) ?: return null
+        val body = exchange(fresh, msg, len)
+        if (body != null) {
+            offerPath(ip, fresh)
+            return body
+        }
+        closeQuietly(fresh)
+        return null
+    }
+
+    private fun openTls(ip: String): SSLSocket? {
         var raw: Socket? = null
-        var tls: SSLSocket? = null
         return try {
             raw = Socket()
             // 预绑定只对 IPv4 做：bind(0) 拿到的是 AF_INET 的 socket，
@@ -195,9 +248,8 @@ class DohResolver(
             }
             // protect 失败时这个 socket 会被自己的隧道路由吞掉，继续 connect 只会
             // 等到超时再静默返回 null；直接放弃，让调用方尽快换下一个 IP。
-            try {
-                if (protectSocket?.invoke(raw) == false) return null
-            } catch (_: Exception) {
+            if (protectSocket?.invoke(raw) == false) {
+                closeQuietly(raw)
                 return null
             }
             raw.connect(InetSocketAddress(ip, target.port), CONNECT_TIMEOUT)
@@ -205,37 +257,37 @@ class DohResolver(
 
             val factory = SSLSocketFactory.getDefault() as SSLSocketFactory
             // 传 host 而不是 ip：SNI 与证书主机名校验都按域名走，TCP 却连在指定 IP 上
-            tls = factory.createSocket(raw, target.host, target.port, true) as SSLSocket
+            val tls = factory.createSocket(raw, target.host, target.port, true) as SSLSocket
             tls.soTimeout = READ_TIMEOUT
             tls.sslParameters = tls.sslParameters.apply { endpointIdentificationAlgorithm = "HTTPS" }
             tls.startHandshake()
-
-            val head = buildString {
-                append("POST ").append(target.path).append(" HTTP/1.1\r\n")
-                append("Host: ")
-                if (target.port == 443) append(target.host) else append(target.host).append(':').append(target.port)
-                append("\r\nContent-Type: ").append(MEDIA_NAME)
-                append("\r\nAccept: ").append(MEDIA_NAME)
-                append("\r\nContent-Length: ").append(len)
-                append("\r\nConnection: close\r\n\r\n")
-            }
-            val out = tls.outputStream
-            out.write(head.toByteArray(Charsets.ISO_8859_1))
-            out.write(msg, 0, len)
-            out.flush()
-            readDnsBody(tls.inputStream)
+            tls
         } catch (_: Exception) {
+            closeQuietly(raw)
             null
-        } finally {
-            try {
-                tls?.close()
-            } catch (_: Exception) {
-            }
-            try {
-                raw?.close()
-            } catch (_: Exception) {
-            }
         }
+    }
+
+    /** 在给定连接上发一次请求并读回 DNS 报文；任何异常都返回 null（连接不再可用）。 */
+    private fun exchange(tls: SSLSocket, msg: ByteArray, len: Int): ByteArray? = try {
+        val head = buildString {
+            append("POST ").append(target.path).append(" HTTP/1.1\r\n")
+            append("Host: ")
+            if (target.port == 443) append(target.host) else append(target.host).append(':').append(target.port)
+            append("\r\nContent-Type: ").append(MEDIA_NAME)
+            append("\r\nAccept: ").append(MEDIA_NAME)
+            append("\r\nContent-Length: ").append(len)
+            // keep-alive：留着连接给下一个查询用（takePath/offerPath 负责生命周期）
+            append("\r\nConnection: keep-alive\r\n\r\n")
+        }
+        val out = tls.outputStream
+        out.write(head.toByteArray(Charsets.ISO_8859_1))
+        out.write(msg, 0, len)
+        out.flush()
+        // 逐字节 read() 在没有缓冲的 SSLSocket 上很贵：包一层缓冲
+        readDnsBody(java.io.BufferedInputStream(tls.inputStream, 4096))
+    } catch (_: Exception) {
+        null
     }
 
     /** 表外域名走这里；连接与解析都由系统负责，可能需要一次明文引导。 */

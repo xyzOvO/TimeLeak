@@ -33,13 +33,20 @@ class EffectVerdictTest {
     }
 
     @Test
-    fun newWindowCountsAsSkipped() {
-        assertTrue(EffectVerdict.judge(true, false, false, true))
+    fun windowEventAloneIsNotEnoughWhenControlStillThere() {
+        // 控件还看得见 = 那一下白点了。悬浮通知、气泡、输入法弹窗都会发窗口事件，
+        // 把「有窗口事件」当成功会让统计虚高（真机踩过）。
+        assertFalse(EffectVerdict.judge(true, false, false, true))
     }
 
     @Test
-    fun windowChangeWinsOverStillVisible() {
-        // 控件还在但已经换了窗口（第二层广告 / 新页面），仍算这次点击生效
-        assertTrue(EffectVerdict.judge(true, false, false, true))
+    fun windowEventCountsWhenVisibilityUnknown() {
+        // 查不到控件（没有 id / 拿不到根）时，只能拿窗口事件当弱证据
+        assertTrue(EffectVerdict.judge(null, false, false, true))
+    }
+
+    @Test
+    fun vanishedControlCountsEvenWithoutWindowEvent() {
+        assertTrue(EffectVerdict.judge(false, false, false, true))
     }
 }

@@ -91,9 +91,10 @@ object BackupRestore {
         str("ruleTier") { if (it in listOf("weak", "medium", "strong")) p.ruleTier = it }
         setOf("customBlocked") { p.customBlocked = it }
         setOf("customAllowed") { p.customAllowed = it }
-        setOf("subscriptions") { p.subscriptions = it }
+        // 订阅地址同样是「会被程序主动请求的 URL」：只收 https，和界面里的校验保持一致。
+        setOf("subscriptions") { p.subscriptions = it.filter { u -> u.startsWith("https://") }.toSet() }
         setOf("skipSubs") { p.skipSubs = it }
-        setOf("subWhitelist") { p.subWhitelist = it }
+        setOf("subWhitelist") { p.subWhitelist = it.filter { u -> u.startsWith("https://") }.toSet() }
         str("customRules") { p.customRules = it }
         if (o.has("appPolicies")) {
             val m = LinkedHashMap<String, String>()
@@ -124,7 +125,10 @@ object BackupRestore {
         bool("bootRestore") { p.bootRestore = it }
         bool("healthNotify") { p.healthNotify = it }
         bool("subAutoApply") { p.subAutoApply = it }
-        return "已恢复 $n 项配置；订阅正文、拦截记录与运行统计未包含在备份中"
+        // 导入完成后必须让服务侧重读配置：否则界面显示已改，隧道里跑的还是旧规则，
+        // 直到用户再动一次开关才会生效（这种「看起来生效了其实没有」最难查）。
+        runCatching { LocalVpnService.send(ctx, LocalVpnService.ACTION_RELOAD) }
+        return "已恢复 $n 项配置，已通知 VPN 重载；订阅正文、拦截记录与运行统计未包含在备份中"
     }
 
     // ---------------- 只导出 / 导入应用规则 ----------------

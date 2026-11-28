@@ -34,6 +34,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Switch
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -707,7 +708,13 @@ private fun BlockLogPage(
             enabled,
             onToggle,
         )
-        ActionButton("清空这份记录", { BlockLog.clear() }, Modifier.fillMaxWidth(), onCard = true)
+        DestructiveButton(
+            "清空这份记录",
+            "要清空拦截记录吗",
+            "只清掉这份列表，不影响规则、统计与放行名单。清空后无法恢复。",
+            Modifier.fillMaxWidth(),
+            onCard = true,
+        ) { BlockLog.clear() }
         Spacer(Modifier.height(8.dp))
         Note("归属说明共 ${ServiceCatalog.size() + ServiceCatalog.generatedSize()} 条：人工核实 ${ServiceCatalog.size()} 个域名后缀（依据见卡片的「资料依据」），另有 ${ServiceCatalog.generatedSize()} 条来自厂商域名族与 anti-AD 上游争议清单，随规则版本 ${ServiceCatalog.ruleSourceLabel()} 生成。查不到归属的只按名称与形态说明，明确标注「推断、未核实」，不编造公司名；识别全在本地，不联网、不上传查询过的域名。")
         Spacer(Modifier.height(4.dp))
@@ -1286,7 +1293,10 @@ private fun ToggleLine(title: String, note: String, checked: Boolean, onChange: 
                         "收起",
                         fontSize = 11.sp,
                         color = ui.accent,
-                        modifier = Modifier.clickable { expanded = false },
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .clickable(role = Role.Button, onClickLabel = "收起这段说明") { expanded = false }
+                            .padding(vertical = 6.dp),
                     )
                 }
             } else {
@@ -1460,6 +1470,41 @@ private fun Hint(text: String, color: Color) {
     ) { Text(text, fontSize = 12.sp, color = color, lineHeight = 18.sp) }
 }
 
+/**
+ * 会丢数据的动作走这里：先弹一次确认再执行。
+ *
+ * 原来「清空这份记录」「清空自定义规则」都是一击即清、没有撤销，手指滑一下就没了。
+ */
+@Composable
+private fun DestructiveButton(
+    text: String,
+    confirmTitle: String,
+    confirmBody: String,
+    modifier: Modifier = Modifier,
+    onCard: Boolean = false,
+    confirmText: String = "确定清空",
+    onConfirm: () -> Unit,
+) {
+    var ask by remember { mutableStateOf(false) }
+    ActionButton(text, { ask = true }, modifier, onCard = onCard)
+    if (ask) {
+        AlertDialog(
+            onDismissRequest = { ask = false },
+            title = { Text(confirmTitle, fontSize = 15.sp) },
+            text = { Text(confirmBody, fontSize = 13.sp) },
+            confirmButton = {
+                TextButton(onClick = {
+                    ask = false
+                    onConfirm()
+                }) { Text(confirmText, color = LocalUi.current.warn) }
+            },
+            dismissButton = {
+                TextButton(onClick = { ask = false }) { Text("取消") }
+            },
+        )
+    }
+}
+
 @Composable
 private fun ActionButton(
     text: String,
@@ -1544,7 +1589,11 @@ private fun RuleRow(text: String, onRemove: () -> Unit) {
             "移除",
             fontSize = 12.sp,
             color = ui.warn,
-            modifier = Modifier.clickable { onRemove() },
+            modifier = Modifier
+                // 12sp 文字的实际热区只有 ~17dp，误触就是直接删条目：至少撑到 48dp
+                .minimumInteractiveComponentSize()
+                .clickable(role = Role.Button, onClickLabel = "移除 $text") { onRemove() }
+                .padding(horizontal = 8.dp, vertical = 12.dp),
         )
     }
 }
@@ -2587,7 +2636,12 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             ActionButton("编辑规则", { showCustom = true }, Modifier.weight(1f))
-            ActionButton("清空", {
+            DestructiveButton(
+                "清空",
+                "要清空自定义规则吗",
+                "这段规则是你手输的，清空后无法恢复；内置与订阅规则不受影响。",
+                Modifier.weight(1f),
+            ) {
                 prefs.customRules = ""
                 customInput = ""
                 scope.launch {
@@ -2597,7 +2651,7 @@ private fun SkipAdPage(ctx: Context, prefs: AppPrefs, scope: kotlinx.coroutines.
                     customCount = 0
                     message = "已清空自定义规则"
                 }
-            }, Modifier.weight(1f))
+            }
         }
         if (customCount > 0) {
             Spacer(Modifier.height(6.dp))

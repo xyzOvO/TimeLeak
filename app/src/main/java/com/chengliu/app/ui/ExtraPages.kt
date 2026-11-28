@@ -27,6 +27,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -366,9 +367,11 @@ fun HealthPage() {
                     Spacer(Modifier.width(8.dp))
                     Box(
                         Modifier
+                            // 11sp 文字 + 7dp 内边距，实际高度只有 ~25dp：撑到可点尺寸再走点击
+                            .minimumInteractiveComponentSize()
                             .clip(RoundedCornerShape(8.dp))
                             .background(ui.bg)
-                            .clickable { act(item) }
+                            .clickable(role = Role.Button, onClickLabel = item.title) { act(item) }
                             .padding(horizontal = 10.dp, vertical = 7.dp),
                     ) {
                         // 已经正常的项目不该再显示「去授权 / 关闭优化」这种自相矛盾的按钮

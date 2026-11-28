@@ -25,6 +25,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -151,10 +152,14 @@ private fun DrawerRow(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .height(46.dp)
+            .height(48.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(if (selected) ui.card else Color.Transparent)
-            .clickable { onClick() }
+            .clickable(
+                role = Role.Button,
+                onClickLabel = item.label,
+                onClick = onClick,
+            )
             .padding(horizontal = 12.dp),
     ) {
         GlyphIcon(item.glyph, if (selected) ui.accent else item.tint, Modifier.size(20.dp))

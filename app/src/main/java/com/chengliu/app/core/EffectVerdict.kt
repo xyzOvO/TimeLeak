@@ -25,8 +25,12 @@ object EffectVerdict {
         pkgChanged: Boolean,
         windowAdvanced: Boolean,
     ): Boolean {
-        if (actChanged || pkgChanged || windowAdvanced) return true
-        // 控件已经查不到了：开屏页连控件一起消失，算生效。
+        // 包名 / Activity 换了：页面确实走了，算生效。
+        if (actChanged || pkgChanged) return true
+        // 「又来了窗口事件」只是弱证据：悬浮通知、气泡、输入法弹出都会发窗口事件。
+        // 只有在我们根本查不到那个控件、没有更强信息时才采信它。
+        if (windowAdvanced && stillVisible == null) return true
+        // 控件还看得见 → 点了没反应；查不到 → 连控件一起消失了，算生效。
         return stillVisible == false
     }
 }

@@ -95,6 +95,21 @@ class LocalVpnService : VpnService() {
     @Volatile
     private var generation = 0L
 
+    /** 前台通知上次刷新的时刻（每包都会经过 onBlocked，必须有时间闸门）。 */
+    private var lastNotifAt = 0L
+
+    /** 配置缓存：这些值原本每个 DNS 包都从 SharedPreferences 读一遍。 */
+    @Volatile
+    private var cfgLeakGuard = false
+    @Volatile
+    private var cfgUpstreamMode = "system"
+    @Volatile
+    private var cfgUpstreamIp = ""
+    @Volatile
+    private var cfgDohUrl = ""
+    @Volatile
+    private var cfgStripEcs = true
+
     // 每个查询都会阻塞在一次上游 socket 收发上。旧实现用无界 CachedThreadPool，
     // 遇到单域名重试风暴（如友盟 430/s）会瞬间 spawn 上千线程 → 线程爆炸 → GC 抖动 → 耗电。
     // 改成有界线程池：核心 4、最大 32、排队 256，队列满时直接丢弃该包（客户端超时重试），
@@ -105,11 +120,20 @@ class LocalVpnService : VpnService() {
         4, 32, 30L, TimeUnit.SECONDS,
         LinkedBlockingQueue(256),
         ThreadFactory { r -> Thread(r, "chengliu-upstream") },
-        RejectedExecutionHandler { _, _ -> /* 极端洪流：丢弃，客户端超时重试，不护线程 */ },
+        RejectedExecutionHandler { _, _ ->
+            // 极端洪流：丢包但不能装没看见 —— 记一次「被节流」，界面能看出上限被打到；
+            // 客户端那边由 readLoop 回 SERVFAIL，立刻失败退避而不是干等超时重试。
+            Counters.add(throttled = 1L)
+        },
     )
 
     /** 规则在后台线程解析，回到主线程重建处理器，避免多线程同时改字段。 */
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    /** 规则/订阅/私人 DNS 的解析线程：这些活会阻塞几百毫秒到数秒，绝不能留在主线程。 */
+    private val rulesWorker = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+        Thread(r, "chengliu-rules")
+    }
 
     @Volatile
     private var cacheKey = ""
@@ -157,6 +181,12 @@ class LocalVpnService : VpnService() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+            // START_STICKY 重启后 intent 是 null：服务活着却从不建隧道，界面显示在跑、
+            // 实际一点流量都没接管。这种情况按「重新开始」处理。
+            null -> {
+                userStopped = false
+                startTunnel()
+            }
             ACTION_START -> {
                 userStopped = false
                 startTunnel()
@@ -192,6 +222,7 @@ class LocalVpnService : VpnService() {
         // 规则加载是后台线程做完再 post 回主线程的；服务销毁后这些回调不该再
         // 重建 handler / capture / lastCaptureKey（还会在主线程 join 2 秒）。
         mainHandler.removeCallbacksAndMessages(null)
+        rulesWorker.shutdownNow()
         // 服务异常退出（省电策略 / 系统回收）时的有限恢复。
         // 只有用户打开了「开机 / 异常自动恢复」才会尝试，且要过恢复预算。
         if (!userStopped && AppPrefs(this).bootRestore) {
@@ -412,8 +443,8 @@ class LocalVpnService : VpnService() {
             return servfailFor(raw)
         }
 
-        // 转发前剥掉 ECS：上游不必知道你在哪个区县
-        val forward = if (prefs.stripEcs) DnsWire.stripEcs(raw, raw.size) ?: raw else raw
+        // 转发前剥掉 ECS：上游不必知道你在哪个区县（开关走缓存，不读 SP）
+        val forward = if (cfgStripEcs) DnsWire.stripEcs(raw, raw.size) ?: raw else raw
         return if (bootstrap) {
             bootstrap().resolve(forward, forward.size)
         } else {
@@ -462,8 +493,8 @@ class LocalVpnService : VpnService() {
     private fun write(output: FileOutputStream, data: ByteArray) {
         synchronized(output) {
             try {
+                // tun 的 FileOutputStream 没有缓冲层，flush() 是纯多余的 syscall（每包一次）。
                 output.write(data)
-                output.flush()
             } catch (_: IOException) {
             }
         }
@@ -481,29 +512,76 @@ class LocalVpnService : VpnService() {
         }
     }
 
-    private fun upstream(): UpstreamResolver = synchronized(this) {
-        val key = "${prefs.leakGuard}|${prefs.upstreamMode}|${prefs.upstreamIp}|${prefs.dohUrl}"
-        val hit = cacheUpstream
-        if (hit != null && cacheKey == key) return@synchronized hit
-        // 防泄露模式下一律走加密上游：跟随系统 / 指定 IP 都是明文，留着等于留后门。
-        val mode = if (prefs.leakGuard) "doh" else prefs.upstreamMode
-        val made: UpstreamResolver = when (mode) {
-            // protect 交给 DohResolver 自己调：这些 DNS 地址也在隧道路由里，
-            // 不自建 socket 就会被自己的隧道吞掉
-            "doh" -> DohResolver(prefs.dohUrl) { protect(it) }
-            "ip" -> SystemUdpResolver(this, prefs.upstreamIp)
-            else -> SystemUdpResolver(this)
+    private fun upstream(): UpstreamResolver {
+        // 每包都会走这里：先读 @Volatile 缓存拼 key，命中就直接返回，不进锁、不碰 SP。
+        val key = "$cfgLeakGuard|$cfgUpstreamMode|$cfgUpstreamIp|$cfgDohUrl"
+        cacheUpstream?.let { if (cacheKey == key) return it }
+        return synchronized(this) {
+            val hit = cacheUpstream
+            if (hit != null && cacheKey == key) {
+                hit
+            } else {
+                // 防泄露模式下一律走加密上游：跟随系统 / 指定 IP 都是明文，留着等于留后门。
+                val mode = if (cfgLeakGuard) "doh" else cfgUpstreamMode
+                val made: UpstreamResolver = when (mode) {
+                    // protect 交给 DohResolver 自己调：这些 DNS 地址也在隧道路由里，
+                    // 不自建 socket 就会被自己的隧道吞掉
+                    "doh" -> DohResolver(cfgDohUrl) { protect(it) }
+                    "ip" -> SystemUdpResolver(this, cfgUpstreamIp)
+                    else -> SystemUdpResolver(this)
+                }
+                cacheKey = key
+                cacheUpstream = made
+                made
+            }
         }
-        cacheKey = key
-        cacheUpstream = made
-        made
     }
 
+    /** 把配置读进缓存字段；只在初始化与配置变更时调用，绝不放在每包路径上。 */
+    private fun refreshCfg() {
+        cfgLeakGuard = prefs.leakGuard
+        cfgUpstreamMode = prefs.upstreamMode
+        cfgUpstreamIp = prefs.upstreamIp
+        cfgDohUrl = prefs.dohUrl
+        cfgStripEcs = prefs.stripEcs
+    }
+
+    /**
+     * 规则重载。
+     *
+     * 这里有两件事会阻塞：解析订阅正文（可能上 MB）、解析系统私人 DNS 主机名
+     * （`join(2000)`，严格私人 DNS 下一条就能吃掉 2 秒）。两者原本都在主线程上，
+     * 而本方法由 onCreate / onStartCommand 调用 —— 直接顶在前台服务 5 秒的窗口上。
+     * 现在主线程只做「用缓存里的旧值把路由集合立起来」，其余全部丢后台，做完再回主线程换处理器。
+     */
     private fun reloadRules() {
+        refreshCfg()
+        // 先用现有缓存（不联网）把 capture 立起来，保证 startTunnel() 的 establish() 有路由可用。
+        primeCapture()
         val tier = RuleTier.of(prefs.ruleTier)
+        rulesWorker.execute {
+            val sub = RuleParser.parseBoth(prefs.subscriptionCache)
+            val pdns = PrivateDns.read(this)
+            val pdnsIps = privateDnsIps(pdns)
+            mainHandler.post { applyRules(tier, sub, pdnsIps) }
+        }
+    }
+
+    /** 不联网的兜底路由：私人 DNS 的 IP 用上次解析结果，没有就不排除。 */
+    private fun primeCapture() {
+        val cached = lastDnsIps ?: emptyList()
+        val (routes, _) = CapturePlan.resolve(prefs.leakTargetIps, cached)
+        capture = routes
+        lastCaptureKey = routes.entries.joinToString(",")
+    }
+
+    private fun applyRules(
+        tier: RuleTier,
+        sub: ParsedRules,
+        pdnsIps: List<String>,
+    ) {
         val builtinOn = prefs.builtinEnabled
         val custom = prefs.customBlocked
-        val sub = RuleParser.parseBoth(prefs.subscriptionCache)
 
         fun apply() {
             val builtin = if (builtinOn) RuleStore.blockedOf(tier.key) else emptySet()
@@ -520,8 +598,6 @@ class LocalVpnService : VpnService() {
 
             // 系统私人 DNS 指定了服务器时，它的地址必须放行，否则 DoT 被隧道吞掉等于整机断解析。
             // 任意主机名（含不在内置表里的）都要解析成真实 IP 才能排除，所以走带网络解析的版本。
-            val pdns = PrivateDns.read(this)
-            val pdnsIps = privateDnsIps(pdns)
             val (routes, dropped) = CapturePlan.resolve(prefs.leakTargetIps, pdnsIps)
             capture = routes
             lastCaptureKey = routes.entries.joinToString(",")
@@ -682,8 +758,14 @@ class LocalVpnService : VpnService() {
         // 「过滤规则命中来源」按名单累计次数，界面上能看出是哪一层规则在干活。
         // onBlocked 内部已经 publish()，这里不必再 refresh() 一遍（每包一次的全量 SP 读取很贵）。
         RunStats.onBlocked(source.label)
-        // 前台通知顺带刷新今日数据；节流，避免每个包都重建通知。
-        if (Counters.today.value.second % 20L == 0L) refreshNotification()
+        // 前台通知顺带刷新今日数据。用时间闸门而不是「能被 20 整除」：
+        // `today` 是 250ms 闸门后的值，同一窗口内根本不变，被判为 0/20 的倍数时
+        // 就变成「每个包都 notify()」，洪流下是上百次通知重建。
+        val notifNow = System.currentTimeMillis()
+        if (notifNow - lastNotifAt > 2000L) {
+            lastNotifAt = notifNow
+            refreshNotification()
+        }
     }
 
     private fun refreshNotification() {

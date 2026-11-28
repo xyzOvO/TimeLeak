@@ -14,6 +14,12 @@ package com.chengliu.app.core
  */
 object DecisionCore {
 
+    /** 编译一次复用：每个候选每轮都要走一遍 decide()，现编正则是纯浪费。 */
+    private val AD_CLASS = Regex("skip|close|splash|advert", RegexOption.IGNORE_CASE)
+    private val DIGIT = Regex("\\d")
+    private val COUNTDOWN_END =
+        Regex("""^(跳过|skip)\s*[（(]?\s*0\s*[s秒]?\s*[)）]?\s*[>»›→]?$""", RegexOption.IGNORE_CASE)
+
     /** 与 SkipPolicy.allows() 完全一致的纯实现，避免离线回归时依赖 Android。 */
     fun policyAllows(kind: AdKind, reason: HitReason, mode: PolicyMode): Boolean {
         if (mode == PolicyMode.DISABLED) return false
@@ -91,14 +97,14 @@ object DecisionCore {
 
         if (f.corner) add(Weights.CORNER, "屏幕四角关闭按钮")
         if (f.clickable) add(Weights.CLICKABLE, "控件可点击")
-        if (Regex("skip|close|splash|advert", RegexOption.IGNORE_CASE).containsMatchIn(f.cls)) {
+        if (AD_CLASS.containsMatchIn(f.cls)) {
             add(Weights.AD_CLASS, "广告 / 跳过类名")
         }
         if (f.scopedRule) add(Weights.SCOPED_BONUS, "规则带包名作用域")
-        if (Regex("\\d").containsMatchIn(label)) add(Weights.COUNTDOWN, "带倒计时数字")
-        if (Regex("""^(跳过|skip)\s*[（(]?\s*0\s*[s秒]?\s*[)）]?\s*[>»›→]?$""", RegexOption.IGNORE_CASE)
-                .matches(label) || label.trim() == "跳过 >"
-        ) add(Weights.COUNTDOWN_END, "倒计时已结束")
+        if (DIGIT.containsMatchIn(label)) add(Weights.COUNTDOWN, "带倒计时数字")
+        if (COUNTDOWN_END.matches(label) || label.trim() == "跳过 >") {
+            add(Weights.COUNTDOWN_END, "倒计时已结束")
+        }
 
         if (!f.inSplash && !f.popupRound) add(Weights.OUTSIDE_WINDOW, "开屏时间窗之外")
         if (f.globalRule) add(Weights.GLOBAL_PENALTY, "全局规则未限定应用")

@@ -86,7 +86,21 @@ object RunStats {
         flusher.scheduleWithFixedDelay({ flush() }, 5, 5, TimeUnit.SECONDS)
     }
 
-    private fun today(): String = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+    /** 日期字符串缓存：ensureDay() 在每个包上都会被调用，而它一天只可能变一次。 */
+    @Volatile
+    private var dayCached = ""
+    @Volatile
+    private var dayCheckedAt = 0L
+
+    private fun today(): String {
+        val now = System.currentTimeMillis()
+        val cached = dayCached
+        if (cached.isNotEmpty() && now - dayCheckedAt < 1000L) return cached
+        val d = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+        dayCached = d
+        dayCheckedAt = now
+        return d
+    }
 
     @Synchronized
     private fun loadFromSp() {
@@ -139,9 +153,37 @@ object RunStats {
         lastSkipMem = null
     }
 
-    /** 构建当前快照：只读内存 + Counters，不再读整个 SP。 */
+    /**
+     * 发布节流：onBlocked 是每个被拦包一次，原来每次都重建整个 Snapshot
+     * （含 sources 的 LinkedHashMap 拷贝）并写 StateFlow，等于「一个包一次全量快照」。
+     * 现在 250ms 一次、中间挤掉，最后一次补发，界面最多滞后 250ms。
+     */
+    private val emitGate = EmitThrottle(250L)
+    @Volatile
+    private var pendingPublish = false
+
     @Synchronized
     private fun publish() {
+        val gateNow = System.nanoTime() / 1_000_000
+        if (emitGate.tryAcquire(gateNow)) {
+            emit()
+        } else if (!pendingPublish) {
+            pendingPublish = true
+            runCatching {
+                flusher.schedule({ trailingPublish() }, emitGate.waitMs(gateNow), TimeUnit.MILLISECONDS)
+            }
+        }
+    }
+
+    private fun trailingPublish() {
+        pendingPublish = false
+        emitGate.markEmitted(System.nanoTime() / 1_000_000)
+        emit()
+    }
+
+    /** 构建当前快照：只读内存 + Counters，不再读整个 SP。 */
+    @Synchronized
+    private fun emit() {
         val q = Counters.today.value
         _state.value = Snapshot(
             date = memDay.ifEmpty { today() },

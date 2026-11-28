@@ -9,6 +9,7 @@ import android.os.Looper
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.Toast
+import com.chengliu.app.BuildConfig
 
 /**
  * 自动跳过开屏广告 / 弹窗 + 摇一摇落地页回退。
@@ -46,7 +47,18 @@ class SkipAdService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
 
     /** 规则解析单线程：几百 KB 的订阅不能在主线程解析，否则抬手就是 ANR。 */
-    private val ruleLoader = java.util.concurrent.Executors.newSingleThreadExecutor()
+    @Volatile
+    private var ruleLoader = newRuleLoader()
+
+    /** 规则线程池：destroy 后同实例可能被重新 bind，池子已经 shutdown，用前必须确认活着。 */
+    private fun ruleRunner(): java.util.concurrent.ExecutorService {
+        val cur = ruleLoader
+        if (!cur.isShutdown) return cur
+        val made = newRuleLoader()
+        ruleLoader = made
+        android.util.Log.i("SkipAd", "规则线程已重建")
+        return made
+    }
 
     /**
      * 取树专用线程。`rootInActiveWindow` 与节点属性全是跨进程调用，单次 2~645ms，
@@ -98,8 +110,15 @@ class SkipAdService : AccessibilityService() {
     private var sessionClicks = 0
     @Volatile
     private var scanning = false
+    /** 占住扫描槽位的时刻；worker 卡死时靠它把槽位抢回来。 */
+    @Volatile
+    private var scanningSince = 0L
+    /** 服务已销毁：此后任何事件都不要再派活（否则会把刚 shutdown 的线程池又建起来）。 */
+    @Volatile
+    private var destroyed = false
     private var lastCache = ""
     private var lastCustom = ""
+    private var lastSyncAt = 0L
     private var eventCount = 0
     private var isPolling = false
 
@@ -161,12 +180,15 @@ class SkipAdService : AccessibilityService() {
     @Volatile
     private var observe = false
     /** 快路径：按上一轮命中的控件 id 直取节点，省掉整棵树遍历。 */
+    @Volatile
     private var fastPath = true
     /** 几何猜测：无文字可点的小控件也当候选（自绘跳过按钮只能这么跳）。 */
     // 与 AppPrefs.skipGeoTap 保持一致：默认关。几何猜测在真机上误判过两次
     // （普通设置页右上角的「去设置」被当成自绘跳过按钮），要开必须由用户手动打开。
+    @Volatile
     private var geoTap = false
     /** 允许猜无文字跳过按钮的应用白名单，由 syncFlags() 跟随配置热更新。 */
+    @Volatile
     private var guessApps: Set<String> = emptySet()
     /** 本开屏窗口已经猜过几次；换窗口清零，上限由 [GuessTargets.maxTries] 决定。 */
     private var geoTries = 0
@@ -346,7 +368,7 @@ class SkipAdService : AccessibilityService() {
             type != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
             type != AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
         ) return
-        if (eventCount < 20) {
+        if (eventCount < 20 && BuildConfig.DEBUG) {
             eventCount++
             android.util.Log.i("SkipAd", "事件 type=$type pkg=${e.packageName}")
         }
@@ -627,7 +649,15 @@ class SkipAdService : AccessibilityService() {
         if (pkg == packageName) return
         // 安装器在 SKIP_PKGS 里（扫广告没意义），只有开了安装拦截才放行。
         if (isSkipPkg(pkg) && !(extraInstall && INSTALLER_PKGS.contains(pkg))) return
+        if (destroyed) return
         val now = System.currentTimeMillis()
+        // 槽位自愈：worker 万一卡死（跨进程读没有超时），这里把槽位抢回来，
+        // 否则之后每一次 scan() 都会被下面这道闸挡掉，跳过功能等于下线。
+        if (scanning && now - scanningSince > STALE_SCAN_MS) {
+            android.util.Log.w("SkipAd", "扫描槽位超时 ${now - scanningSince}ms，强制回收")
+            scanning = false
+            scanWorker = newScanWorker()
+        }
         if (scanning) {
             // content-changed 触发的重复扫描不记心跳，否则列表会被「被节流合并」刷满。
             if (force) beat(now, pkg, 0, 0, BeatStage.SKIPPED, BeatResult.THROTTLED, "上一次扫描还没结束")
@@ -637,6 +667,7 @@ class SkipAdService : AccessibilityService() {
         // 一次立即扫描，绝不能被上一个窗口留下的 lastScanAt 挡掉。
         if (!force && now - lastScanAt < scanGap(now)) return
         scanning = true
+        scanningSince = now
         // 槽位在派活的那一刻就占住：worker 在跑的时候来的事件应该被上面那道闸挡掉，
         // 而不是排队堆起来——堆起来的每一轮都是几百毫秒的跨进程读。
         lastScanAt = now
@@ -1036,7 +1067,8 @@ class SkipAdService : AccessibilityService() {
             // 时那是用户要点的功能，不是广告入口。
             // 顺序不是遍历顺序：一屏真假两个「跳过」时，先试更像真按钮的那个
             // （自身可点、面积小、贴近屏幕角）。
-            for (r in HitRanker.order(refs, ::rankKey)) {
+            val ordered = HitRanker.order(refs, ::rankKey)
+            for (r in ordered) {
                 // 记忆命中优先：这一条是上次真正点掉过广告的控件，只是它常常没有文字
                 // （有的应用把真按钮做成一个无字图标），靠文案匹配永远轮不到它。
                 if (t.fastId.isNotEmpty() && r.id == t.fastId) {
@@ -1067,7 +1099,7 @@ class SkipAdService : AccessibilityService() {
             if (t.geo.isNotEmpty()) {
                 android.util.Log.i(
                     "SkipAd",
-                    "几何候选=${t.geo.size} 猜测=${t.guess} 广告痕迹=${looksLikeAd(refs)} " +
+                    "几何候选=${t.geo.size} 猜测=${t.guess} 广告痕迹=$adHint " +
                         "深挖=${t.deepAd} 整屏=${t.full} 已猜=$geoTries/$guessMax",
                 )
             }
@@ -1099,6 +1131,7 @@ class SkipAdService : AccessibilityService() {
             for (n in scanNodes) recycleNode(n)
             scanNodes.clear()
             scanning = false
+            scanningSince = 0L
         }
     }
 
@@ -1197,7 +1230,8 @@ class SkipAdService : AccessibilityService() {
      * 但仍要求控件够小且是窄控件。
      */
     private fun scanExplicit(refs: List<Ref>, screen: Rect, now: Long): Boolean {
-        for (r in HitRanker.order(refs, ::rankKey)) {
+        val ordered = HitRanker.order(refs, ::rankKey)
+        for (r in ordered) {
             if (r.bounds.width() >= screen.width() * NARROW_RATIO) continue
             if (!SkipEngine.isSafeTarget(r.text, r.desc)) continue
             val s = r.text.ifEmpty { r.desc }
@@ -1869,6 +1903,12 @@ class SkipAdService : AccessibilityService() {
             return Verify("控件不再像跳过按钮", driftPx, false)
         }
         // 窗口归属再确认：用户可能已经从开屏页点进主页，这时按旧坐标点就是误触。
+        // 先用窗口事件维护的 curPkg 比一次（零成本）；只有它没答案时才去取根节点
+        // —— 取根是跨进程调用，真机实测 2~645ms，直接压在点击延迟上。
+        val topKnown = curPkg
+        if (!topKnown.isNullOrEmpty() && topKnown != expectPkg) {
+            return Verify("前台已切到 $topKnown", driftPx, false)
+        }
         val root = rootInActiveWindow ?: return Verify("当前窗口读不到", driftPx, false)
         try {
             val top = root.packageName?.toString().orEmpty()
@@ -1901,7 +1941,8 @@ class SkipAdService : AccessibilityService() {
         if (!performGlobalAction(GLOBAL_ACTION_BACK)) return false
         lastBackAt = now
         lastClickAt = now
-        lastClickKey = "back"
+        // 不要写 lastClickKey：它是「本窗口上一次点的控件」，写成 "back" 之后
+        // 闸门会认为「点过别的控件了」，同窗口后面的跳过按钮全部被挡掉。
         lastClickBase = ""
         sessionClicks++
         cooldownUntil = now + Weights.COOLDOWN_MS
@@ -1976,14 +2017,20 @@ class SkipAdService : AccessibilityService() {
         val now = System.currentTimeMillis()
 
         var stillVisible: Boolean? = null
-        if (viewId.isNotEmpty()) {
+        // 只有真正的资源 id 才能查树：几何键是 "geom@l,t,r,b"，喂给 findByViewId 必然抛
+        // 异常，异常被 getOrNull() 吞掉后变成「查不到 = 控件消失 = 跳过成功」，
+        // 于是点了没反应也照样记一次跳过 —— 这正是之前统计虚高的来源之一。
+        if (viewId.contains(":id/")) {
             val root = runCatching { rootInActiveWindow }.getOrNull()
             if (root != null) {
                 val found = runCatching {
                     root.findAccessibilityNodeInfosByViewId(viewId)
                 }.getOrNull()
-                stillVisible = found?.any { runCatching { it.isVisibleToUser }.getOrDefault(false) } ?: false
-                found?.forEach { recycleNode(it) }
+                // 查树失败（异常）时保持 null：不确定就是不确定，不能当成「已经消失」。
+                if (found != null) {
+                    stillVisible = found.any { runCatching { it.isVisibleToUser }.getOrDefault(false) }
+                    found.forEach { recycleNode(it) }
+                }
             }
         }
 
@@ -2082,10 +2129,14 @@ class SkipAdService : AccessibilityService() {
                 }
             }
             val hit = picked ?: return null
-            scanNodes.add(hit)
-            return refOf(hit, scanNodes.size - 1, screen)
+            // parent 本来就在 scanNodes 里（collect 每层都会登记），这里再回收会让
+            // Ref.nodeIndex 指向已释放的句柄，后续 refresh()/performAction 直接抛异常。
+            // 统一交给 finishScan 收尾；重复登记也一并避开，否则同一个句柄会被回收两次。
+            if (scanNodes.none { it === hit }) scanNodes.add(hit)
+            val idx = scanNodes.indexOfFirst { it === hit }
+            return refOf(hit, if (idx >= 0) idx else scanNodes.size - 1, screen)
         } finally {
-            recycleNode(parent)
+            // 故意什么都不做：见上面的说明，回收权归 finishScan。
         }
     }
 
@@ -2118,6 +2169,11 @@ class SkipAdService : AccessibilityService() {
     }
 
     private fun syncEngine() {
+        // 列表滚动时每秒几十条无障碍事件，每条都比对一次订阅正文 + 自定义规则
+        // （两个可能上 MB 的字符串）纯属浪费；配置变更是人手点的，1 秒粒度足够。
+        val syncNow = System.currentTimeMillis()
+        if (syncNow - lastSyncAt in 1..SYNC_GAP_MS) return
+        lastSyncAt = syncNow
         SkipEngine.builtin = prefs.skipBuiltin
         syncFlags()
         val cache = prefs.skipSubCache
@@ -2131,7 +2187,7 @@ class SkipAdService : AccessibilityService() {
 
     /** 后台解析规则，解析完成后 [SkipEngine] 会一次性换掉快照。 */
     private fun loadRules(cache: String, custom: String) {
-        ruleLoader.execute {
+        ruleRunner().execute {
             runCatching {
                 SkipEngine.ensureLoaded(cache, custom)
                 android.util.Log.i(
@@ -2159,8 +2215,14 @@ class SkipAdService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onDestroy() {
+        destroyed = true
         stopPolling()
         ruleLoader.shutdownNow()
+        // reconnectScan 也要撤：否则销毁后它还会触发一次 scan()，把线程池重新建起来，
+        // 而那时候服务已经不再被系统持有，这条线程就成了没人回收的孤儿。
+        handler.removeCallbacks(reconnectScan)
+        handler.removeCallbacks(pendingScan)
+        handler.removeCallbacks(pollTask)
         SkipAdState.onDisconnected(stateToken)
         // 授权还在、服务却断了 —— 多半是省电策略把服务冻住了。
         // 只提醒一次，不尝试后台重启（系统不允许），更不弹系统授权窗口。
@@ -2230,6 +2292,16 @@ class SkipAdService : AccessibilityService() {
         /** 开屏窗内容变化的合并上限：既保住首帧，也别每秒扫八次扫满整段开屏。 */
         const val SPLASH_MERGE_MAX_MS = 240L
 
+    /**
+     * 扫描槽位的兜底回收时间：取树卡在跨进程读上时（rootInActiveWindow 没有超时参数），
+     * 槽位会一直处于占用状态，之后每次 scan() 都在闸门处返回 —— 整条跳过链路静默失效。
+     * 两倍扫描预算还没回来就认为这一轮已经死了。
+     */
+    const val STALE_SCAN_MS = 240L
+
+    /** 配置同步的节流间隔：列表滚动时每秒几十条事件，没必要每条都比对两个大字符串。 */
+    const val SYNC_GAP_MS = 1000L
+
         /** 几何猜测轮最多收几个候选（只收屏幕边缘带的小控件，宁少勿滥）。 */
         const val MAX_GEO_CANDS = 6
 
@@ -2291,6 +2363,10 @@ class SkipAdService : AccessibilityService() {
          */
         fun newScanWorker(): java.util.concurrent.ExecutorService =
             java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "SkipScan") }
+
+        /** 规则解析线程池；destroy 后可能被重新 bind，所以做成可重建的工厂。 */
+        fun newRuleLoader(): java.util.concurrent.ExecutorService =
+            java.util.concurrent.Executors.newSingleThreadExecutor { r -> Thread(r, "SkipRules") }
 
         /** 去掉数字后比较，倒计时文本才认得出是同一个按钮。 */
         val NUM = Regex("[0-9\\s]")
